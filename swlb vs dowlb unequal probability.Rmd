@@ -7,7 +7,7 @@ output: html_document
 ```{r}
 ############################################################
 ## Unequal-probability single-stage design:
-## D-OWLB vs S-WLB (using your current code style)
+## D-OWLB vs S-WLB 
 ############################################################
 
 library(MASS)       # polr
@@ -18,7 +18,7 @@ library(foreach)
 set.seed(2026)
 
 ############################################################
-# 0. Disparity functional and helper (same as your code)
+# 0. Disparity functional and helper 
 ############################################################
 
 apouey_disparity = function(cumprobs, gamma = 0.73, C = 2^gamma) {
@@ -45,7 +45,7 @@ disparity_from_fit = function(fit, data,
 }
 
 ############################################################
-# 1. Population generator (reuse your gen_population)
+# 1. Population generator 
 ############################################################
 
 gen_population = function(N_pop = 1e5,
@@ -241,7 +241,7 @@ dowlb_unequal_disp = function(samp, B = 400, gamma = 0.73) {
 }
 
 ############################################################
-# 4. Monte Carlo simulation (parallel on Windows)
+# 4. Monte Carlo simulation 
 ############################################################
 
 N_pop    = 1e5
@@ -313,10 +313,6 @@ results = foreach(rep_id = seq_len(n_sims),
 }
 
 stopCluster(cl)
-
-############################################################
-# 5. Summaries: bias, RMSE, coverage, variance ratios
-############################################################
 
 ############################################################
 # 5. Summaries: bias, RMSE, coverage, variance, MSE
@@ -434,4 +430,5 @@ for (g in groups) {
 
 print(rest_tbl_unequal)
 write.csv(rest_tbl_unequal, "Results_DWOLB/comparison_unequal_probability.csv")
+
 ```
