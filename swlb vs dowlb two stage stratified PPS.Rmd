@@ -1,0 +1,821 @@
+---
+title: "swlb vs dowlb informative try 2"
+author: "Ujjayini Das"
+date: "2025-12-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# packages
+library(MASS)       # polr
+library(parallel)
+library(doParallel)
+library(foreach)
+# optional reproducible parallel RNG:
+# install.packages("doRNG"); library(doRNG)
+
+```
+
+```{r}
+############################################################
+## Design-aware OWLB vs S-WLB: Two-stage Stratified Design
+## Fixed and defensive version for parallel runs
+############################################################
+
+
+############################################################
+# 0. Disparity functional and helper (unchanged)
+############################################################
+
+apouey_disparity = function(cumprobs, gamma = 0.73, C = 2^gamma) {
+  1 - (C / (length(cumprobs))) * sum(abs(cumprobs - 0.5)^gamma)
+}
+
+disparity_from_fit = function(fit, data,
+                              group_var = "SES",
+                              y_var = "Y",
+                              gamma = 0.73) {
+  K = length(levels(data[[y_var]]))
+  groups = sort(unique(data[[group_var]]))
+  Dg = setNames(numeric(length(groups)), groups)
+
+  for (g in groups) {
+    newdat = data
+    newdat[[group_var]] = factor(g, levels = levels(data[[group_var]]))
+    p_cat = predict(fit, newdata = newdat, type = "probs")
+    p_bar = colMeans(p_cat)
+    cumprobs = cumsum(p_bar)[1:(K - 1)]
+    Dg[g] = apouey_disparity(cumprobs, gamma = gamma)
+  }
+  Dg
+}
+
+############################################################
+# 1. Generate finite population with strong PSU effects
+#    (fixed sample.int bug and defensive code)
+############################################################
+
+gen_population = function(N_pop = 1e5,
+                          H = 4,
+                          mean_psu_size = 80,
+                          K = 5,
+                          sigma_u = 1.5) {
+
+  stratum = sample(1:H, N_pop, replace = TRUE)
+  psu = integer(N_pop)
+  id  = seq_len(N_pop)
+
+  tab_h = table(stratum)
+  J_h_target = as.numeric(tab_h) / mean_psu_size
+  names(J_h_target) = names(tab_h)
+  J_h = pmax(2L, round(J_h_target))
+  names(J_h) = names(tab_h)
+
+  for (h_char in names(tab_h)) {
+    h = as.integer(h_char)
+    idx_h = which(stratum == h)
+    nh = length(idx_h)
+    if (nh == 0) next
+
+    J_hh = J_h[h_char]
+    if (!is.finite(J_hh) || J_hh < 2) J_hh = 2L
+    J_hh = as.integer(J_hh)
+
+    # FIX: use J_hh (not the whole vector J_h)
+    psu[idx_h] = sample.int(J_hh, nh, replace = TRUE)
+  }
+
+  psu_df = unique(data.frame(stratum = stratum, psu = psu))
+  psu_df$u_hj = rnorm(nrow(psu_df), mean = 0, sd = sigma_u)
+
+  pop = data.frame(id = id, stratum = stratum, psu = psu)
+  pop = merge(pop, psu_df, by = c("stratum", "psu"), all.x = TRUE, sort = FALSE)
+  pop = pop[order(pop$id), ]
+
+  SES = sample(1:3, N_pop, replace = TRUE, prob = c(0.3, 0.4, 0.3))
+  X1  = rnorm(N_pop)
+  X2  = rbinom(N_pop, 1, 0.5)
+
+  beta_SES_stratum = matrix(
+    c(-2, -0.5, 0,
+      -1, -0.2, 0,
+      -0.6, -0.2, 0,
+      -0.3, -0.2, 0),
+    nrow = H, byrow = TRUE
+  )
+
+  # ensure indexing safe:
+  if (any(pop$stratum < 1 | pop$stratum > nrow(beta_SES_stratum))) {
+    stop("gen_population: unexpected stratum labels")
+  }
+  beta_SES_unit = beta_SES_stratum[cbind(pop$stratum, SES)]
+
+  eta = 0.1 + 0.5 * X1 + 0.8 * X2 + beta_SES_unit + pop$u_hj
+
+  alpha = c(-1.0, -0.3, 0.4, 1.2)
+
+  lp = sapply(alpha, function(a) plogis(a - eta))
+  p_cat = cbind(lp[, 1],
+                 lp[, 2] - lp[, 1],
+                 lp[, 3] - lp[, 2],
+                 lp[, 4] - lp[, 3],
+                 1 - lp[, 4])
+  Y = apply(p_cat, 1, function(p) sample(1:K, 1, prob = p))
+
+  pop$SES = factor(SES)
+  pop$X1 = X1
+  pop$X2 = X2
+  pop$Y  = factor(Y, ordered = TRUE)
+
+  pop$u_hj = NULL
+  pop
+}
+
+############################################################
+# 2. Two-stage stratified PPS design (informative)
+#    (made psu_frame creation robust and safe handling of empty lists)
+############################################################
+
+sample_two_stage = function(pop,
+                             m_h = 10,
+                             m_hj = 50) {
+
+  H = length(unique(pop$stratum))
+
+  # ---- Build PSU-level frame ----
+  psu_N = aggregate(id ~ stratum + psu, data = pop, FUN = length)
+  names(psu_N)[3] = "N_hj"
+
+  psu_ord = aggregate(list(medY = as.numeric(pop$Y)),
+                       by = list(stratum = pop$stratum, psu = pop$psu),
+                       FUN = median)
+  names(psu_ord)[3] = "qY"   # ordinal summary (median category)
+
+  psu_frame = merge(psu_N, psu_ord, by = c("stratum", "psu"))
+  if (nrow(psu_frame) == 0) stop("sample_two_stage: empty PSU frame")
+
+  # PPS measure with exponential size adjustment
+  lambda = 1.5
+   # stratum-specific normalization of qY
+  q_sum_by_stratum = tapply(psu_frame$qY, psu_frame$stratum, sum)
+  norm_q = mapply(function(q, h) {
+    s = q_sum_by_stratum[as.character(h)]
+    if (is.na(s) || s <= 0) return(0)
+    q / s
+  }, psu_frame$qY, psu_frame$stratum)
+
+  psu_frame$size = psu_frame$N_hj * exp(lambda * norm_q)
+  psu_frame$size[!is.finite(psu_frame$size) | psu_frame$size < 0] = 0
+  
+  # ---- Stage 1: PPS selection of PSUs within each stratum ----
+  sel_psu_list = lapply(split(psu_frame, psu_frame$stratum), function(df) {
+    if (nrow(df) == 0) return(NULL)
+    m = min(m_h, nrow(df))
+
+    prob = df$size
+    prob[!is.finite(prob) | prob < 0] = 0
+    if (sum(prob) <= 0) prob = rep(1, nrow(df))
+    prob = prob / sum(prob)
+
+    df[sample(seq_len(nrow(df)), m, prob = prob), , drop = FALSE]
+  })
+
+  sel_psu_list2 = sel_psu_list[!vapply(sel_psu_list, is.null, logical(1))]
+  if (length(sel_psu_list2) == 0) stop("sample_two_stage: no PSUs selected")
+  sel_psu = do.call(rbind, sel_psu_list2)
+
+  # Mark selection
+  pop$key = paste(pop$stratum, pop$psu)
+  sel_psu$key = with(sel_psu, paste(stratum, psu))
+  pop$PSU_selected = pop$key %in% sel_psu$key
+
+  # ---- Stage 2: SRSWOR inside selected PSUs ----
+  split_pop = split(pop, pop$key)
+  samp_list = vector("list", length(split_pop))
+  names(samp_list) = names(split_pop)
+
+  idx = 1
+  for (k in names(split_pop)) {
+    df = split_pop[[k]]
+
+    if (!df$PSU_selected[1]) {
+      samp_list[[idx]] = NULL
+    } else {
+      nhj = min(m_hj, nrow(df))
+      samp_list[[idx]] = df[sample(seq_len(nrow(df)), nhj), , drop = FALSE]
+    }
+
+    idx = idx + 1
+  }
+
+  samp_list2 = samp_list[!vapply(samp_list, is.null, logical(1))]
+  if (length(samp_list2) == 0) stop("sample_two_stage: no units in stage 2 sample")
+
+  samp = do.call(rbind, samp_list2)
+
+  # ---- Recompute PSU-level sample info ----
+  psu_samp = aggregate(id ~ stratum + psu, data = samp, FUN = length)
+  names(psu_samp)[3] = "n_hj"
+
+  psu_samp = merge(psu_samp, psu_frame[, c("stratum", "psu", "N_hj")],
+                   by = c("stratum", "psu"), all.x = TRUE, sort = FALSE)
+
+  # ---- Stage 1 inclusion probability (approx PPS) ----
+  psu_samp$pi1 = with(psu_samp, ave(N_hj, stratum, FUN = function(z) {
+    m = min(m_h, length(z))
+    if (sum(z) <= 0) return(rep(NA_real_, length(z)))
+    m * z / sum(z)
+  }))
+
+  psu_samp$w1 = 1 / psu_samp$pi1  # Stage 1 weight
+
+  samp = merge(samp, psu_samp, by = c("stratum", "psu"), all.x = TRUE, sort = FALSE)
+
+  # ---- Stage 2 inclusion probability ----
+  samp$pi2 = with(samp, ifelse(N_hj > 0, n_hj / N_hj, NA_real_))
+  samp$w2 = 1 / samp$pi2
+
+  # ---- Final combined weight ----
+  samp$w = samp$w1 * samp$w2
+  samp$pi = samp$pi1 * samp$pi2
+
+  # cleanup
+  samp$key = NULL
+  samp$PSU_selected = NULL
+  samp
+}
+
+
+############################################################
+# 3. Methods: Naive, Weighted, S-WLB, D-OWLB
+############################################################
+
+fit_naive = function(samp, gamma = 0.73) {
+  fit = polr(Y ~ SES + X1 + X2, data = samp, Hess = TRUE, method = "logistic")
+  disparity_from_fit(fit, samp, group_var = "SES", gamma = gamma)
+}
+
+fit_weighted = function(samp, gamma = 0.73) {
+  if (is.null(samp$w)) stop("fit_weighted: samp lacks 'w' column")
+  fit = polr(Y ~ SES + X1 + X2, data = samp, weights = w, Hess = TRUE, method = "logistic")
+  disparity_from_fit(fit, samp, group_var = "SES", gamma = gamma)
+}
+
+swlb_disp = function(samp, B = 400, gamma = 0.73) {
+  n = nrow(samp)
+  w_raw = samp$w
+  w_scaled = n * w_raw / sum(w_raw)
+
+  Glevels = levels(samp$SES)
+  res = matrix(NA_real_, nrow = B, ncol = length(Glevels),
+               dimnames = list(NULL, Glevels))
+
+  for (b in 1:B) {
+    Yw = rgamma(n, shape = 1, scale = w_scaled)
+    g  = Yw / sum(Yw)
+    fitb = polr(Y ~ SES + X1 + X2, data = samp, weights = g, Hess = FALSE, method = "logistic")
+    res[b, ] = disparity_from_fit(fitb, samp, group_var = "SES", gamma = gamma)
+  }
+  res
+}
+
+dowlb_twostage_disp = function(samp, B = 400, gamma = 0.73,
+                                m_h_star_frac = 0.5,   # fraction of observed PSUs to pick per replicate
+                                n_hj_star_frac = 0.5,  # fraction of observed SSUs per PSU to pick per replicate
+                                verbose = FALSE) {
+  # REQUIRE: samp must contain columns: stratum, psu, w1 (stage-1 PSU weight repeated per unit),
+  # w2 (stage-2 conditional weight), w (final combined weight). Optional: N_hj (PSU frame size),
+  # n_hj (observed sample count per PSU), M_h (frame PSUs per stratum).
+  if (nrow(samp) == 0) stop("dowlb_twostage_disp: empty samp")
+  req = c("stratum", "psu", "w1", "w2", "w")
+  if (!all(req %in% names(samp))) {
+    stop("samp must contain columns: ", paste(req, collapse = ", "))
+  }
+
+  # keep original ordering
+  samp$.__rowid__ = seq_len(nrow(samp))
+
+  Glevels = levels(samp$SES)
+  D_mat = matrix(NA_real_, nrow = B, ncol = length(Glevels),
+                  dimnames = list(NULL, Glevels))
+
+  # Build PSU table: one row per sampled PSU with w_jh (w1), observed n_hj, optional N_hj
+  psu_tab = unique(samp[, c("stratum", "psu", "w1")])
+  names(psu_tab)[names(psu_tab) == "w1"] = "w_jh"
+
+  # observed sample counts per PSU
+  psu_n = aggregate(.__rowid__ ~ stratum + psu, data = samp, FUN = length)
+  names(psu_n)[3] = "n_hj"
+  psu_tab = merge(psu_tab, psu_n, by = c("stratum", "psu"), all.x = TRUE, sort = FALSE)
+
+  # optional frame PSU sizes per PSU (N_hj). If present in samp, use it; else fallback to n_hj
+  if ("N_hj" %in% names(samp)) {
+    psu_N = unique(samp[, c("stratum", "psu", "N_hj")])
+    psu_tab = merge(psu_tab, psu_N, by = c("stratum", "psu"), all.x = TRUE, sort = FALSE)
+  } else {
+    psu_tab$N_hj = psu_tab$n_hj
+  }
+
+  # Number of sampled PSUs per stratum (m_h) and approximate M_h (fallback to m_h)
+  m_h_tab = aggregate(psu ~ stratum, data = psu_tab, FUN = function(x) length(unique(x)))
+  names(m_h_tab)[2] = "m_h"
+  # If M_h known in samp, use it; else fallback to m_h
+  if ("M_h" %in% names(samp)) {
+    Mtab = unique(samp[, c("stratum", "M_h")])
+    m_h_tab = merge(m_h_tab, Mtab, by = "stratum", all.x = TRUE, sort = FALSE)
+    m_h_tab$M_h[is.na(m_h_tab$M_h)] = m_h_tab$m_h[is.na(m_h_tab$M_h)]
+  } else {
+    m_h_tab$M_h = m_h_tab$m_h
+  }
+  psu_tab = merge(psu_tab, m_h_tab, by = "stratum", all.x = TRUE, sort = FALSE)
+
+  # Main replicate loop
+  for (b in seq_len(B)) {
+    if (verbose && b %% 50 == 0) message("D-OWLB replicate ", b, "/", B)
+
+    # Build per-stratum lists for PSU replicate weights
+    strata = sort(unique(psu_tab$stratum))
+    w_jh_star_list = vector("list", length = length(strata))
+    names(w_jh_star_list) = strata
+
+    # Stage 1: PSU-level resampling & compute w_jh_star
+    for (h in strata) {
+      idx_h = which(psu_tab$stratum == h)
+      psu_h  = psu_tab$psu[idx_h]
+      w_jh_orig = psu_tab$w_jh[idx_h]
+      m_h0 = as.integer(unique(psu_tab$m_h[idx_h]))
+      M_h0 = as.integer(unique(psu_tab$M_h[idx_h]))
+      if (is.na(m_h0) || m_h0 < 1) m_h0 = length(psu_h)
+      if (is.na(M_h0) || M_h0 < 1) M_h0 = m_h0
+
+      # choose m_h_star (tunable fraction)
+      m_h_star = max(1L, as.integer(floor(m_h_star_frac * m_h0)))
+      if (m_h_star >= m_h0) m_h_star = max(1L, m_h0 - 1L)
+
+      # select PSUs without replacement
+      sel = sample(psu_h, size = m_h_star, replace = FALSE)
+      delta_jh = as.integer(psu_h %in% sel)
+
+      # compute lambda_h
+      f_h = ifelse(M_h0 > 0, m_h0 / M_h0, 0)
+      denom_h = max(1, (m_h0 - m_h_star))
+      lambda_h = sqrt( (m_h_star * (1 - f_h)) / denom_h )
+      if (!is.finite(lambda_h)) lambda_h = 0
+
+      # compute w_jh_star
+      w_jh_star = w_jh_orig * (1 - lambda_h + lambda_h * (m_h0 / max(1, m_h_star)) * delta_jh)
+
+      w_jh_star_list[[as.character(h)]] = data.frame(
+        stratum = h,
+        psu     = psu_h,
+        w_jh    = w_jh_orig,
+        w_jh_star = w_jh_star,
+        delta_jh  = delta_jh,
+        stringsAsFactors = FALSE
+      )
+    } # end strata loop
+
+    w_jh_star_df = do.call(rbind, w_jh_star_list)
+    # Merge w_jh_star onto unit-level sample
+    samp_b = merge(samp, w_jh_star_df[, c("stratum", "psu", "w_jh_star", "w_jh", "delta_jh")],
+                    by = c("stratum", "psu"), all.x = TRUE, sort = FALSE)
+    samp_b = samp_b[order(samp_b$.__rowid__), ]
+
+    if (nrow(samp_b) != nrow(samp)) stop("dowlb_twostage_disp: merge changed row count")
+    if (any(is.na(samp_b$w_jh_star))) stop("dowlb_twostage_disp: missing w_jh_star after merge")
+
+    # Stage 2: SSU-level resampling & compute w_{i|jh}^*
+    # Ensure n_hj and N_hj available per PSU
+    if (!("n_hj" %in% names(samp_b))) {
+      # computed earlier as counts per PSU in sample
+      n_tab = aggregate(.__rowid__ ~ stratum + psu, samp_b, FUN = length)
+      names(n_tab)[3] = "n_hj"
+      samp_b = merge(samp_b, n_tab, by = c("stratum", "psu"), all.x = TRUE, sort = FALSE)
+      samp_b = samp_b[order(samp_b$.__rowid__), ]
+    }
+    if (!("N_hj" %in% names(samp_b))) {
+      samp_b$N_hj = samp_b$n_hj  # fallback -> f_jh = 1 -> lambda_jh = 0
+    }
+
+    samp_b$w_i_cond_star = NA_real_
+
+    # iterate PSUs (could be vectorized with data.table for speed)
+    pu_keys = unique(paste(samp_b$stratum, samp_b$psu, sep = "||"))
+    for (key in pu_keys) {
+      idx_units = which(paste(samp_b$stratum, samp_b$psu, sep = "||") == key)
+      n_hj_obs = unique(samp_b$n_hj[idx_units]); if (length(n_hj_obs)!=1) n_hj_obs = length(idx_units)
+      N_hj_val = unique(samp_b$N_hj[idx_units]); if (length(N_hj_val)!=1) N_hj_val = n_hj_obs
+      # choose n_hj_star (tunable)
+      n_hj_star = max(1L, as.integer(floor(n_hj_star_frac * n_hj_obs)))
+      if (n_hj_star >= n_hj_obs) n_hj_star = max(1L, n_hj_obs - 1L)
+
+      # which PSU and stratum
+      str_h = samp_b$stratum[idx_units[1]]
+      # m_h0 for that stratum (sampled PSUs)
+      m_h0_val = as.integer(unique(psu_tab$m_h[psu_tab$stratum == str_h])); if (length(m_h0_val)==0) m_h0_val = sum(psu_tab$stratum == str_h)
+      m_h_star_val = max(1L, as.integer(floor(m_h_star_frac * m_h0_val)))
+      if (m_h_star_val >= m_h0_val) m_h_star_val = max(1L, m_h0_val - 1L)
+
+      # select SSUs within PSU without replacement
+      sel_local = sample(seq_along(idx_units), size = n_hj_star, replace = FALSE)
+      delta_ijh = integer(length(idx_units)); delta_ijh[sel_local] = 1L
+
+      # retrieve w_jh and w_jh_star and delta_jh for this PSU
+      w_jh_this = unique(samp_b$w_jh[idx_units]); if (length(w_jh_this)!=1) w_jh_this = sum(samp_b$w1[idx_units])
+      w_jh_star_this = unique(samp_b$w_jh_star[idx_units]); if (length(w_jh_star_this)!=1) w_jh_star_this = w_jh_this
+      delta_jh_this = unique(as.integer(samp_b$delta_jh[idx_units])); if (length(delta_jh_this)!=1) delta_jh_this = 0L
+
+      # compute lambda_jh
+      f_jh = ifelse(N_hj_val > 0, n_hj_obs / N_hj_val, 0)
+      denom_jh = max(1, (n_hj_obs - n_hj_star))
+      # note use f_h from earlier computed per-stratum; compute anew
+      M_h0 = unique(psu_tab$M_h[psu_tab$stratum == str_h]); if (length(M_h0)==0) M_h0 = m_h0_val
+      f_h_val = ifelse(M_h0 > 0, m_h0_val / M_h0, 0)
+      lambda_jh = sqrt( (n_hj_star * f_h_val * (1 - f_jh)) / denom_jh )
+      if (!is.finite(lambda_jh)) lambda_jh = 0
+
+      # compute multiplicative factor for each unit in PSU
+      sqrt_term = sqrt( max(1, m_h0_val) / max(1, m_h_star_val) )
+      factor_base = 1 - lambda_h + lambda_h * (m_h0_val / max(1, m_h_star_val)) * delta_jh_this
+      factor_vec = factor_base - lambda_jh * sqrt_term * delta_jh_this +
+        lambda_jh * sqrt_term * delta_jh_this * (n_hj_obs / max(1, n_hj_star)) * delta_ijh
+
+      # w_{i|jh}^* = w_{i|jh} * (w_jh / w_jh_star) * factor_vec
+      w_i_jh = samp_b$w2[idx_units]
+      ratio_jh = ifelse(w_jh_star_this == 0, 1, (w_jh_this / w_jh_star_this))
+      w_i_cond_star_vals = w_i_jh * ratio_jh * factor_vec
+
+      # guard non-finite or non-positive
+      bad = !is.finite(w_i_cond_star_vals) | (w_i_cond_star_vals <= 0)
+      if (any(bad)) w_i_cond_star_vals[bad] = pmax(1e-8, w_i_jh[bad])
+
+      samp_b$w_i_cond_star[idx_units] = w_i_cond_star_vals
+    } # end PSU loop
+
+    # overall replicate unit weight: w_ijh^* = w_jh_star * w_{i|jh}^*
+    samp_b$w_unit_star = samp_b$w_jh_star * samp_b$w_i_cond_star
+    samp_b$w_unit_star[!is.finite(samp_b$w_unit_star) | samp_b$w_unit_star <= 0] = 1e-8
+
+    # normalize so sum(w_unit_star) = n
+    n_units = nrow(samp_b)
+    sum_w_star = sum(samp_b$w_unit_star)
+    if (!(is.finite(sum_w_star) && sum_w_star > 0)) {
+      warning("dowlb_twostage_disp: non-positive sum of w_unit_star; falling back to samp$w")
+      samp_b$w_unit_star = samp_b$w
+      sum_w_star = sum(samp_b$w_unit_star)
+    }
+    w_tilde = (n_units / sum_w_star) * samp_b$w_unit_star  # normalized scale
+
+    # Gamma draws and normalized g weights
+    V = rgamma(n_units, shape = 1, scale = w_tilde)
+    g = V / sum(V)
+    # Fallback small jitter if any zeros
+    if (any(!is.finite(g) | g <= 0)) {
+      g = (V + runif(n_units, 0, 1e-12)) / sum(V + runif(n_units, 0, 1e-12))
+    }
+
+    # Fit ordinal model using polr with weights = g
+    fitb = tryCatch({
+      polr(Y ~ SES + X1 + X2, data = samp_b, weights = g, Hess = FALSE, method = "logistic")
+    }, error = function(e) {
+      # retry with tiny jitter on g
+      g2 = g + runif(length(g), 0, 1e-8)
+      polr(Y ~ SES + X1 + X2, data = samp_b, weights = g2, Hess = FALSE, method = "logistic")
+    })
+
+    # compute disparity and store
+    D_b = disparity_from_fit(fitb, samp_b, group_var = "SES", gamma = gamma)
+    D_mat[b, ] = D_b
+  } # end B loop
+
+  samp$.__rowid__ = NULL
+  D_mat
+}
+
+
+############################################################
+# 4. Parallel Monte Carlo simulation
+############################################################
+
+N_pop    = 1e5
+H        = 4
+K        = 5
+n_sims   = 100
+B_boot   = 400
+gamma_D  = 0.73
+
+set.seed(2025)
+pop = gen_population(N_pop = N_pop, H = H, K = K, sigma_u = 1.5)
+
+true_D = sapply(levels(pop$SES), function(g) {
+  sub = pop[pop$SES == g, ]
+  tab = table(sub$Y)
+  p_cat = as.numeric(tab) / sum(tab)
+  cumprobs = cumsum(p_cat)[1:(length(p_cat) - 1)]
+  apouey_disparity(cumprobs, gamma = gamma_D)
+})
+names(true_D) = levels(pop$SES)
+
+#true_fit = polr(Y ~ SES + X1 + X2, data = pop, Hess = TRUE, method = "logistic")
+#true_D   = disparity_from_fit(true_fit, pop, group_var = "SES", gamma = gamma_D)
+groups = levels(pop$SES)
+
+sim_one = function(rep_id) {
+  # avoid cat in parallel (keeps output tidy); use message() if needed
+  message("Sim ", rep_id)
+  samp = sample_two_stage(pop, m_h = 10, m_hj = 50)
+  if (nrow(samp) == 0) stop("Empty sample in replicate ", rep_id)
+  if (any(is.na(samp$stratum)) || any(is.na(samp$psu))) {
+    stop("Missing stratum/psu in replicate ", rep_id)
+  }
+
+  D_naive = fit_naive(samp, gamma = gamma_D)
+  D_wt    = fit_weighted(samp, gamma = gamma_D)
+
+  swlb_mat = swlb_disp(samp, B = B_boot, gamma = gamma_D)
+  s_mean = colMeans(swlb_mat, na.rm = TRUE)
+  s_var   = apply(swlb_mat, 2, var, na.rm = TRUE)
+  s_L    = apply(swlb_mat, 2, quantile, probs = 0.025, na.rm = TRUE)
+  s_U    = apply(swlb_mat, 2, quantile, probs = 0.975, na.rm = TRUE)
+
+  dowlb_mat = dowlb_twostage_disp(samp, B = B_boot, gamma = gamma_D)
+  d_mean = colMeans(dowlb_mat, na.rm = TRUE)
+  d_var   = apply(dowlb_mat, 2, var, na.rm = TRUE)
+  d_L    = apply(dowlb_mat, 2, quantile, probs = 0.025, na.rm = TRUE)
+  d_U    = apply(dowlb_mat, 2, quantile, probs = 0.975, na.rm = TRUE)
+
+  list(
+    D_true  = true_D,
+    D_naive = D_naive,
+    D_wt    = D_wt,
+    D_swlb = s_mean,
+    D_dowlb = d_mean,
+    s_L = s_L, s_U = s_U, s_var = s_var,
+    d_L = d_L, d_U = d_U, d_var = d_var
+  )
+}
+
+# Start parallel cluster
+n_cores = max(1L, parallel::detectCores() - 1L)
+cl = makeCluster(n_cores)
+registerDoParallel(cl)
+
+# Export objects and functions to workers (safer)
+export_objs = c("pop", "true_D", "gen_population", "sample_two_stage",
+                "fit_naive", "fit_weighted", "swlb_disp",
+                "dowlb_twostage_disp", "disparity_from_fit", "apouey_disparity",
+                "disparity_from_fit")
+
+# You can use doRNG for reproducible results; here I'm not including it by default.
+results_twostage = foreach(rep_id = seq_len(n_sims),
+                   .packages = c("MASS", "survey"),
+                   .export = export_objs,
+                   .errorhandling = "stop") %dopar% {
+  sim_one(rep_id)
+}
+
+results_twostage2 = foreach(rep_id = seq_len(n_sims),
+                   .packages = c("MASS", "survey"),
+                   .export = export_objs,
+                   .errorhandling = "stop") %dopar% {
+  sim_one(rep_id)
+}
+stopCluster(cl)
+
+############################################################
+# 5. Summaries: bias, RMSE, coverage, variance, MSE
+############################################################
+
+res_tbl = data.frame(
+  group = groups,
+  rel_bias_naive    = NA,
+  rel_bias_wt       = NA,
+  rel_rmse_wt       = NA,
+  rel_bias_swlb     = NA,
+  rel_rmse_swlb     = NA,
+  rel_bias_dowlb    = NA,
+  rel_rmse_dowlb    = NA,
+  cov_swlb          = NA,
+  cov_dowlb         = NA,
+  var_ratio_swlb    = NA,
+  var_ratio_dowlb   = NA,
+  # MSE for design-weighted estimator
+  bias_wt           = NA,
+  var_wt            = NA,
+  mse_wt            = NA,
+  bias2_over_mse_wt = NA,
+  var_over_mse_wt   = NA,
+  # NEW: MSE for S-WLB and D-OWLB point estimators
+  mse_swlb          = NA,
+  mse_dowlb         = NA,
+  mse_ratio_swlb    = NA,
+  mse_ratio_dowlb   = NA,
+  stringsAsFactors  = FALSE
+)
+
+for (g in groups) {
+  true_g     = sapply(results_twostage, function(x) x$D_true[g])
+  hat_n_g    = sapply(results_twostage, function(x) x$D_naive[g])
+  hat_w_g    = sapply(results_twostage, function(x) x$D_wt[g])
+  hat_swlb_g = sapply(results_twostage, function(x) x$D_swlb[g])
+  hat_dowlb_g= sapply(results_twostage, function(x) x$D_dowlb[g])
+
+  mean_true  = mean(true_g, na.rm = TRUE)
+
+  # --- Design-weighted estimator: MC bias, var, MSE ---
+  mean_w  = mean(hat_w_g, na.rm = TRUE)
+  bias_w  = mean_w - mean_true
+  var_w   = var(hat_w_g, na.rm = TRUE)
+  mse_w   = mean((hat_w_g - true_g)^2, na.rm = TRUE)
+
+  # --- S-WLB and D-OWLB point estimators: MSE ---
+  mse_s   = mean((hat_swlb_g - true_g)^2, na.rm = TRUE)
+  mse_d   = mean((hat_dowlb_g - true_g)^2, na.rm = TRUE)
+
+  # bootstrap variance averages
+  s_var_g   = sapply(results_twostage, function(x) x$s_var[g])
+  d_var_g   = sapply(results_twostage, function(x) x$d_var[g])
+  mean_s_var = mean(s_var_g, na.rm = TRUE)
+  mean_d_var = mean(d_var_g, na.rm = TRUE)
+
+  # --- Relative bias (%), using true_g ---
+  res_tbl$rel_bias_naive[res_tbl$group == g] =
+    100 * mean(hat_n_g - true_g, na.rm = TRUE) / mean_true
+  res_tbl$rel_bias_wt[res_tbl$group == g] =
+    100 * (mean_w - mean_true) / mean_true
+  res_tbl$rel_bias_swlb[res_tbl$group == g] =
+    100 * (mean(hat_swlb_g, na.rm = TRUE) - mean_true) / mean_true
+  res_tbl$rel_bias_dowlb[res_tbl$group == g] =
+    100 * (mean(hat_dowlb_g, na.rm = TRUE) - mean_true) / mean_true
+
+  # --- Relative RMSE (%): sqrt(MSE) scaled by mean_true ---
+  rmse_w    = sqrt(mse_w)
+  rmse_swlb = sqrt(mse_s)
+  rmse_dowlb= sqrt(mse_d)
+
+  res_tbl$rel_rmse_wt[res_tbl$group == g]    = 100 * rmse_w    / mean_true
+  res_tbl$rel_rmse_swlb[res_tbl$group == g]  = 100 * rmse_swlb / mean_true
+  res_tbl$rel_rmse_dowlb[res_tbl$group == g] = 100 * rmse_dowlb/ mean_true
+
+  # --- Coverage ---
+  s_Lg = sapply(results_twostage, function(x) x$s_L[g])
+  s_Ug = sapply(results_twostage, function(x) x$s_U[g])
+  d_Lg = sapply(results_twostage, function(x) x$d_L[g])
+  d_Ug = sapply(results_twostage, function(x) x$d_U[g])
+
+  res_tbl$cov_swlb[res_tbl$group == g] =
+    mean(true_g >= s_Lg & true_g <= s_Ug, na.rm = TRUE)
+  res_tbl$cov_dowlb[res_tbl$group == g] =
+    mean(true_g >= d_Lg & true_g <= d_Ug, na.rm = TRUE)
+
+  # --- Variance ratios (bootstrap / MC var of weighted estimator) ---
+  res_tbl$var_ratio_swlb[res_tbl$group == g] = mean_s_var / var_w
+  res_tbl$var_ratio_dowlb[res_tbl$group == g] = mean_d_var / var_w
+
+  # --- Store MSE decomposition for design-weighted estimator ---
+  res_tbl$bias_wt[res_tbl$group == g]  = bias_w
+  res_tbl$var_wt[res_tbl$group == g]   = var_w
+  res_tbl$mse_wt[res_tbl$group == g]   = mse_w
+  if (mse_w > 0) {
+    res_tbl$bias2_over_mse_wt[res_tbl$group == g] = (bias_w^2) / mse_w
+    res_tbl$var_over_mse_wt[res_tbl$group == g]   = var_w / mse_w
+  } else {
+    res_tbl$bias2_over_mse_wt[res_tbl$group == g] = NA
+    res_tbl$var_over_mse_wt[res_tbl$group == g]   = NA
+  }
+
+  # --- Store MSE for S-WLB and D-OWLB point estimators ---
+  res_tbl$mse_swlb[res_tbl$group == g] = mse_s
+  res_tbl$mse_dowlb[res_tbl$group == g] = mse_d
+  if (mse_w > 0) {
+    res_tbl$mse_ratio_swlb[res_tbl$group == g] = mse_s / mse_w
+    res_tbl$mse_ratio_dowlb[res_tbl$group == g] = mse_d / mse_w
+  } else {
+    res_tbl$mse_ratio_swlb[res_tbl$group == g] = NA
+    res_tbl$mse_ratio_dowlb[res_tbl$group == g] = NA
+  }
+}
+
+print(res_tbl)
+write.csv(res_tbl,"Results_DWOLB/comparison_twostage_stratified_cluster_strong_clustering.csv")
+```
+
+```{r}
+############################################################
+# 5. Summaries: bias, RMSE, coverage, variance, MSE
+############################################################
+
+res_tbl2 = data.frame(
+  group = groups,
+  rel_bias_naive    = NA,
+  rel_bias_wt       = NA,
+  rel_rmse_wt       = NA,
+  rel_bias_swlb     = NA,
+  rel_rmse_swlb     = NA,
+  rel_bias_dowlb    = NA,
+  rel_rmse_dowlb    = NA,
+  cov_swlb          = NA,
+  cov_dowlb         = NA,
+  var_ratio_swlb    = NA,
+  var_ratio_dowlb   = NA,
+  # MSE for design-weighted estimator
+  bias_wt           = NA,
+  var_wt            = NA,
+  mse_wt            = NA,
+  bias2_over_mse_wt = NA,
+  var_over_mse_wt   = NA,
+  # NEW: MSE for S-WLB and D-OWLB point estimators
+  mse_swlb          = NA,
+  mse_dowlb         = NA,
+  mse_ratio_swlb    = NA,
+  mse_ratio_dowlb   = NA,
+  stringsAsFactors  = FALSE
+)
+
+for (g in groups) {
+  true_g     = sapply(results_twostage2, function(x) x$D_true[g])
+  hat_n_g    = sapply(results_twostage2, function(x) x$D_naive[g])
+  hat_w_g    = sapply(results_twostage2, function(x) x$D_wt[g])
+  hat_swlb_g = sapply(results_twostage2, function(x) x$D_swlb[g])
+  hat_dowlb_g= sapply(results_twostage2, function(x) x$D_dowlb[g])
+
+  mean_true  = mean(true_g, na.rm = TRUE)
+
+  # --- Design-weighted estimator: MC bias, var, MSE ---
+  mean_w  = mean(hat_w_g, na.rm = TRUE)
+  bias_w  = mean_w - mean_true
+  var_w   = var(hat_w_g, na.rm = TRUE)
+  mse_w   = mean((hat_w_g - true_g)^2, na.rm = TRUE)
+
+  # --- S-WLB and D-OWLB point estimators: MSE ---
+  mse_s   = mean((hat_swlb_g - true_g)^2, na.rm = TRUE)
+  mse_d   = mean((hat_dowlb_g - true_g)^2, na.rm = TRUE)
+
+  # bootstrap variance averages
+  s_var_g   = sapply(results_twostage2, function(x) x$s_var[g])
+  d_var_g   = sapply(results_twostage2, function(x) x$d_var[g])
+  mean_s_var = mean(s_var_g, na.rm = TRUE)
+  mean_d_var = mean(d_var_g, na.rm = TRUE)
+
+  # --- Relative bias (%), using true_g ---
+  res_tbl2$rel_bias_naive[res_tbl2$group == g] =
+    100 * mean(hat_n_g - true_g, na.rm = TRUE) / mean_true
+  res_tbl2$rel_bias_wt[res_tbl2$group == g] =
+    100 * (mean_w - mean_true) / mean_true
+  res_tbl2$rel_bias_swlb[res_tbl2$group == g] =
+    100 * (mean(hat_swlb_g, na.rm = TRUE) - mean_true) / mean_true
+  res_tbl2$rel_bias_dowlb[res_tbl2$group == g] =
+    100 * (mean(hat_dowlb_g, na.rm = TRUE) - mean_true) / mean_true
+
+  # --- Relative RMSE (%): sqrt(MSE) scaled by mean_true ---
+  rmse_w    = sqrt(mse_w)
+  rmse_swlb = sqrt(mse_s)
+  rmse_dowlb= sqrt(mse_d)
+
+  res_tbl2$rel_rmse_wt[res_tbl2$group == g]    = 100 * rmse_w    / mean_true
+  res_tbl2$rel_rmse_swlb[res_tbl2$group == g]  = 100 * rmse_swlb / mean_true
+  res_tbl2$rel_rmse_dowlb[res_tbl2$group == g] = 100 * rmse_dowlb/ mean_true
+
+  # --- Coverage ---
+  s_Lg = sapply(results_twostage2, function(x) x$s_L[g])
+  s_Ug = sapply(results_twostage2, function(x) x$s_U[g])
+  d_Lg = sapply(results_twostage2, function(x) x$d_L[g])
+  d_Ug = sapply(results_twostage2, function(x) x$d_U[g])
+
+  res_tbl2$cov_swlb[res_tbl2$group == g] =
+    mean(true_g >= s_Lg & true_g <= s_Ug, na.rm = TRUE)
+  res_tbl2$cov_dowlb[res_tbl2$group == g] =
+    mean(true_g >= d_Lg & true_g <= d_Ug, na.rm = TRUE)
+
+  # --- Variance ratios (bootstrap / MC var of weighted estimator) ---
+  res_tbl2$var_ratio_swlb[res_tbl2$group == g] = mean_s_var / var_w
+  res_tbl2$var_ratio_dowlb[res_tbl2$group == g] = mean_d_var / var_w
+
+  # --- Store MSE decomposition for design-weighted estimator ---
+  res_tbl2$bias_wt[res_tbl2$group == g]  = bias_w
+  res_tbl2$var_wt[res_tbl2$group == g]   = var_w
+  res_tbl2$mse_wt[res_tbl2$group == g]   = mse_w
+  if (mse_w > 0) {
+    res_tbl2$bias2_over_mse_wt[res_tbl2$group == g] = (bias_w^2) / mse_w
+    res_tbl2$var_over_mse_wt[res_tbl2$group == g]   = var_w / mse_w
+  } else {
+    res_tbl2$bias2_over_mse_wt[res_tbl2$group == g] = NA
+    res_tbl2$var_over_mse_wt[res_tbl2$group == g]   = NA
+  }
+
+  # --- Store MSE for S-WLB and D-OWLB point estimators ---
+  res_tbl2$mse_swlb[res_tbl2$group == g] = mse_s
+  res_tbl2$mse_dowlb[res_tbl2$group == g] = mse_d
+  if (mse_w > 0) {
+    res_tbl2$mse_ratio_swlb[res_tbl2$group == g] = mse_s / mse_w
+    res_tbl2$mse_ratio_dowlb[res_tbl2$group == g] = mse_d / mse_w
+  } else {
+    res_tbl2$mse_ratio_swlb[res_tbl2$group == g] = NA
+    res_tbl2$mse_ratio_dowlb[res_tbl2$group == g] = NA
+  }
+}
+
+print(res_tbl2)
+write.csv(res_tbl2,"Results_DWOLB/comparison_twostage_stratified_cluster_moderate_clustering.csv")
+```

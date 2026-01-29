@@ -1,0 +1,683 @@
+---
+title: "BRFSS data analysis DWOLB"
+author: "Ujjayini Das"
+date: "2025-12-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# packages
+library(MASS)       # polr
+library(future.apply)
+library(survey)
+library(srvyr)
+library(tidyverse)
+library(ggplot2)
+# optional reproducible parallel RNG:
+# install.packages("doRNG"); library(doRNG)
+
+```
+
+```{r}
+# Data preprocessing
+# Load the data
+brfss2023 = read_csv("Data/brfss2023data.csv")
+# Choose variables needed only for Maryland
+df_analysis = brfss2023 %>%
+  dplyr::select(x_state, x_psu, x_ststr, genhlth, sexvar, x_llcpwt, ladult1, x_educag, x_ageg5yr, x_incomg1) %>% filter(x_state == 24)
+# Retain complete cases only among adults (18+) n = 65209
+df_complete = df_analysis %>%
+  filter(ladult1 == 1)%>%
+  drop_na() %>%
+  filter(!genhlth %in% c(7,9) & x_ageg5yr!= 14 & x_educag!=9 & x_incomg1!= 9)
+# Create SES groups based on income and education
+df_complete = df_complete %>%
+  mutate(
+    ses = case_when(
+      # ---- HIGH SES (3) ----
+      # College/tech grad AND income >= $50k
+      x_educag == 4 & x_incomg1 %in% c(5, 6, 7) ~ 3L,
+      # Some college AND income >= $100k
+      x_educag == 3 & x_incomg1 %in% c(6, 7)    ~ 3L,
+
+      # ---- LOW SES (1) ----
+      # Income < $25k
+      x_incomg1 %in% c(1, 2)                 ~ 1L,
+      # <HS with income < $50k or missing income
+      x_educag == 1 & (x_incomg1 %in% c(1, 2, 3, 4)) ~ 1L,
+
+      # ---- MIDDLE SES (2) ----
+      # Everyone else with both education and income observed
+      !is.na(x_educag) & !is.na(x_incomg1)      ~ 2L
+    )
+  ) 
+
+# Descriptive statistics
+options(survey.lonely.psu = "adjust") 
+
+## 1. Define survey design
+brfss_des = svydesign(
+  ids    = ~ x_psu,
+  strata = ~ x_ststr,
+  weights= ~ x_llcpwt,
+  nest   = TRUE,
+  data   = df_complete
+)
+
+## 2. Recode variables 
+df_complete = df_complete %>%
+  mutate(
+    SES  = factor(ses, levels = c(1, 2, 3),
+                   labels = c("Low", "Middle", "High")),
+    sex = factor(sexvar, levels = c(1, 2),
+                   labels = c("Male", "Female")),
+    # 5-category self-rated health from GENHLTH
+    health = factor(
+      genhlth,
+      levels = c(1, 2, 3, 4, 5),
+      labels = c("Excellent", "Very good", "Good", "Fair", "Poor")
+    ),
+    age = factor(
+      x_ageg5yr,
+      levels = 1:13,
+      labels = c(
+        "18–24", "25–29", "30–34", "35–39", "40–44",
+        "45–49", "50–54", "55–59", "60–64", "65–69",
+        "70–74", "75–79", "80+"
+      )
+    )
+  )
+
+brfss_des = update(brfss_des,
+                    SES  = df_complete$SES,
+                    sex = df_complete$sex,
+                    health = df_complete$health,
+                    age = df_complete$age)
+
+svy_crosstab <- function(design, row_var, ses_var = "SES") {
+  tab <- svytable(as.formula(paste("~", row_var, "+", ses_var)), design)
+  prop <- prop.table(tab, margin = 2) * 100  # column %
+  
+  list(counts = tab, col_perc = prop)
+}
+
+## 1) Age x SES (SES in columns)
+age_ses <- svy_crosstab(brfss_des, "age", "SES")
+age_ses$counts      # weighted counts
+age_ses$col_perc    # column % (within SES); each SES column sums to 100
+
+## 2) Sex x SES
+sex_ses <- svy_crosstab(brfss_des, "sex", "SES")
+sex_ses$col_perc
+
+## 3) Health x SES
+health_ses <- svy_crosstab(brfss_des, "health", "SES")
+health_ses$col_perc
+
+## 3. Weighted sample sizes by SES 
+ses_n = svytable(~ SES, design = brfss_des)
+ses_n
+
+# Core analysis
+## Ordinal models
+# Weighted cumulative logit (pseudo-MLE):
+# scaled weight to sample sizes
+df_complete$wt =  df_complete$x_llcpwt*nrow(df_complete)/sum(df_complete$x_llcpwt)
+fit_wt_df <- polr(
+  formula = health ~ SES + age + sex,
+  data    = df_complete,
+  weights = wt,
+  Hess    = TRUE,
+  method  = "logistic"
+)
+
+# Naive (unweighted) model:
+fit_naive_df <- polr(
+  formula = health ~ SES + age + sex,
+  data    = df_complete,
+  Hess    = TRUE,
+  method  = "logistic"
+)
+
+## Apouey Index
+gamma_apouey <- 0.73
+apouey_from_fit_df <- function(fit, data, ses_var = "SES",
+                            gamma = gamma_apouey) {
+
+  p_hat <- predict(fit, type = "probs")   # n x K matrix
+  K     <- ncol(p_hat)
+  p_df <- as.data.frame(p_hat)
+  colnames(p_df) <- paste0("p", seq_len(K))  # p1..pK
+  tmp <- data %>%
+    mutate(ses_tmp = .data[[ses_var]]) %>%
+    bind_cols(p_df)
+
+  # Average probabilities by SES (matrix per SES)
+  avg_list <- tmp %>%
+    group_by(SES) %>%
+    summarize(
+      across(starts_with("p"), mean),
+      .groups = "drop"
+    )
+
+  # Turn into matrix of avg probs: G x K
+  P_mat <- as.matrix(avg_list %>% select(starts_with("p")))  # rows = SES groups
+  colnames(P_mat) <- paste0("p", seq_len(K))
+
+  # Cumulative probabilities F_g(k) for each SES (row-wise cumsum)
+  F_mat <- t(apply(P_mat, 1, cumsum))   # same dims G x K
+
+  # Use first K-1 cumulatives for Apouey
+  F_sub <- F_mat[, 1:(K - 1), drop = FALSE]
+
+  # Compute D_g for each SES group
+  D_vec <- 1 - (2^gamma / (K - 1)) *
+    apply(abs(F_sub - 0.5)^gamma, 1, sum)
+
+  # Return data frame SES + D
+  data.frame(
+    SES = avg_list$SES,
+    D   = D_vec
+  )
+}
+
+
+D_naive <- apouey_from_fit_df(fit_naive_df, df_complete)
+D_wt    <- apouey_from_fit_df(fit_wt_df,    df_complete)
+
+## Design based estimation
+apouey_from_weights <- function(w, health, SES, gamma = gamma_apouey) {
+  # w: numeric vector of weights (length n)
+  # health: ordered factor
+  # SES: factor
+
+  idx_by_ses <- split(seq_along(health), SES)
+
+  D_list <- lapply(idx_by_ses, function(idx) {
+    w_g <- w[idx]
+    h_g <- health[idx]
+
+    tab <- tapply(w_g, h_g, sum)
+    tab[is.na(tab)] <- 0
+
+    p <- tab / sum(tab)
+    F <- cumsum(p)
+    K <- length(p)
+
+    D <- 1 - (2^gamma / (K - 1)) *
+      sum(abs(F[1:(K - 1)] - 0.5)^gamma)
+
+    D
+  })
+
+  data.frame(
+    SES = names(D_list),
+    D   = unlist(D_list),
+    row.names = NULL
+  )
+}
+
+## 2. Full-sample (design-based) Apouey -------------------------------
+
+dat <- model.frame(brfss_des)
+w0  <- weights(brfss_des)
+
+D_design <- apouey_from_weights(
+  w      = w0,
+  health = dat$health,
+  SES    = dat$SES
+)
+D_design
+
+## 3. Replicate weights and replicate Apouey ---------------------------
+
+B <- 400
+brfss_rep_design <- as.svrepdesign(
+  brfss_des,
+  type      = "mrbbootstrap",
+  replicates = B
+)
+
+# matrix n x B of replicate analysis weights
+rep_wts_design <- weights(brfss_rep_design, type = "analysis")
+n_design       <- nrow(dat)
+
+# compute Apouey for each replicate and SES
+rep_results <- vector("list", B)
+
+for (b in seq_len(B)) {
+  w_b <- rep_wts_design[, b]
+
+  D_b <- apouey_from_weights(
+    w      = w_b,
+    health = dat$health,
+    SES    = dat$SES
+  )
+  D_b$rep <- b
+  rep_results[[b]] <- D_b
+}
+
+D_rep_all <- bind_rows(rep_results)
+# D_rep_all: columns SES, D, rep
+
+## 4. Design-based variance and SE by SES ------------------------------
+
+design_apouey_summary <- D_rep_all %>%
+  group_by(SES) %>%
+  summarize(
+    D_design   = D_design$D[match(first(SES), D_design$SES)],
+    var_design = var(D),
+    se_design  = sqrt(var_design),
+    lower_ci       = quantile(D, 0.025),
+    upper_ci      = quantile(D, 0.975),
+    .groups    = "drop"
+  )
+
+design_apouey_summary
+
+## Bootstraps
+
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+## S-WLB
+one_swlb <- function(b, data) {
+  w      <- data$x_llcpwt
+  n      <- length(w)
+  shape  <- 1
+  scale  <- n * w / sum(w)
+  V      <- rgamma(n, shape = shape, scale = scale)
+  w_star <- V / sum(V) * sum(w)
+start_coef  <- coef(fit_wt_df)
+start_zeta  <- fit_wt_df$zeta
+  fit_b <- try(
+    polr(
+    health ~ SES + age + sex,
+    data    = data,
+    weights = w_star,
+    start = c(start_coef, start_zeta),
+    Hess    = FALSE,
+    method  = "logistic"
+  ),
+  silent = TRUE)
+
+  if (inherits(fit_b, "try-error")) {
+    return(NULL)   # skip this replicate
+  }
+  
+  D_b <- apouey_from_fit_df(fit_b, data)
+  D_b$rep <- b
+  D_b
+}
+
+set.seed(123)
+swlb_list <- future_lapply(1:B, one_swlb, data = df_complete, future.seed = TRUE)
+swlb_res  <- dplyr::bind_rows(Filter(Negate(is.null), swlb_list))
+
+swlb_summary_df <- swlb_res %>%
+  dplyr::group_by(SES) %>%
+  dplyr::summarize(
+    D_hat_swlb = mean(D),
+    var_swlb   = var(D),
+    se_swlb    = sqrt(var_swlb),
+    lower_ci       = quantile(D, 0.025),
+    upper_ci      = quantile(D, 0.975),
+    .groups    = "drop"
+  )
+
+## D-OWLB
+## replicate weights with Preston
+brfss_rep <- as.svrepdesign(
+  brfss_des,
+  type      = "mrbbootstrap",
+  replicates = B
+)
+## replicate weights with Rao-Wu (n-1)
+brfss_rep_rw <- as.svrepdesign(
+  brfss_des,
+  type      = "subbootstrap",
+  replicates = B
+)
+rep_wts <- weights(brfss_rep, type = "analysis")
+rep_wts_rw <- weights(brfss_rep_rw, type = "analysis")
+n       <- nrow(df_complete)
+
+one_dowlb <- function(b, data, rep_wts_mat) {
+  w_rep <- rep_wts_mat[, b]
+
+  shape  <- 1
+  scale  <- n * w_rep / sum(w_rep)
+  V      <- rgamma(n, shape = shape, scale = scale)
+  w_star <- V / sum(V) * sum(w_rep)
+  
+  start_coef  <- coef(fit_wt_df)
+  start_zeta  <- fit_wt_df$zeta
+
+  fit_b <- polr(
+    health ~ SES + age + sex,
+    data    = data,
+    weights = w_star,
+    Hess    = FALSE,
+    start = c(start_coef, start_zeta),
+    method  = "logistic"
+  )
+
+  D_b <- apouey_from_fit_df(fit_b, data)
+  D_b$rep <- b
+  D_b
+}
+
+set.seed(456)
+dowlb_list <- future_lapply(1:B, one_dowlb,
+                            data = df_complete,
+                            rep_wts_mat = rep_wts, future.seed = TRUE)
+dowlb_res  <- dplyr::bind_rows(dowlb_list)
+
+dowlb_summary_df <- dowlb_res %>%
+  dplyr::group_by(SES) %>%
+  dplyr::summarize(
+    D_hat_dowlb = mean(D),
+    var_dowlb   = var(D),
+    se_dowlb    = sqrt(var_dowlb),
+    lower_ci        = quantile(D, 0.025),
+    upper_ci      = quantile(D, 0.975),
+    .groups     = "drop"
+  )
+
+dowlb_list_rw <- future_lapply(1:B, one_dowlb,
+                            data = df_complete,
+                            rep_wts_mat = rep_wts_rw, future.seed = TRUE)
+dowlb_res_rw  <- dplyr::bind_rows(dowlb_list_rw)
+
+dowlb_summary_rw_df <- dowlb_res_rw %>%
+  dplyr::group_by(SES) %>%
+  dplyr::summarize(
+    D_hat_dowlb = mean(D),
+    var_dowlb   = var(D),
+    se_dowlb    = sqrt(var_dowlb),
+    q2.5        = quantile(D, 0.025),
+    q97.5       = quantile(D, 0.975),
+    .groups     = "drop"
+  )
+
+D_naive_named <- D_naive %>% dplyr::rename(D_hat_naive = D)
+D_wt_named    <- D_wt    %>% dplyr::rename(D_hat_wt    = D)
+
+comparison <- D_naive_named %>%
+  dplyr::left_join(D_wt_named,    by = "SES") %>%
+  dplyr::left_join(swlb_summary_df,  by = "SES") %>%
+  dplyr::left_join(dowlb_summary_df, by = "SES",
+                   suffix = c("_swlb", "_dowlb")) %>%
+  dplyr::mutate(
+    vr_swlb_vs_dowlb = var_swlb / var_dowlb
+  )
+
+comparison
+
+
+apouey_compare <- design_apouey_summary %>%
+  left_join(
+    swlb_summary_df %>% select(SES, D_hat_swlb, var_swlb, se_swlb, lower_ci, upper_ci),
+    by = "SES"
+  ) %>%
+  left_join(
+    dowlb_summary_df %>% select(SES, D_hat_dowlb, var_dowlb, se_dowlb, lower_ci, upper_ci),
+    by = "SES"
+  ) %>%
+  mutate(
+    ratio_swlb  = var_swlb  / var_design,
+    ratio_dowlb = var_dowlb / var_design
+  )
+
+apouey_compare
+write.csv(apouey_compare,"comparison_variance_ratios_BRFSS.csv")
+```
+
+```{r}
+# validation on simpler functionals
+df_simple = brfss2023 %>%
+  dplyr::select(x_state, x_psu, x_ststr, exerhmm1, sexvar, x_llcpwt, ladult1, x_educag, x_ageg5yr, x_incomg1) %>% filter(x_state == 24) %>%
+  filter(ladult1 == 1)%>%
+  drop_na() %>%
+  filter(x_ageg5yr!= 14 & x_educag!=9 & x_incomg1!= 9)
+# Create SES groups based on income and education
+df_simple = df_simple %>%
+  mutate(
+    ses = case_when(
+      # ---- HIGH SES (3) ----
+      # College/tech grad AND income >= $50k
+      x_educag == 4 & x_incomg1 %in% c(5, 6, 7) ~ 3L,
+      # Some college AND income >= $100k
+      x_educag == 3 & x_incomg1 %in% c(6, 7)    ~ 3L,
+
+      # ---- LOW SES (1) ----
+      # Income < $25k
+      x_incomg1 %in% c(1, 2)                 ~ 1L,
+      # <HS with income < $50k or missing income
+      x_educag == 1 & (x_incomg1 %in% c(1, 2, 3, 4)) ~ 1L,
+
+      # ---- MIDDLE SES (2) ----
+      # Everyone else with both education and income observed
+      !is.na(x_educag) & !is.na(x_incomg1)      ~ 2L
+    )
+  ) 
+
+# Descriptive statistics
+options(survey.lonely.psu = "adjust") 
+
+## 1. Define survey design
+brfss_simple = svydesign(
+  ids    = ~ x_psu,
+  strata = ~ x_ststr,
+  weights= ~ x_llcpwt,
+  nest   = TRUE,
+  data   = df_simple
+)
+
+## 2. Recode variables 
+df_simple = df_simple %>%
+  mutate(
+    SES  = factor(ses, levels = c(1, 2, 3),
+                   labels = c("Low", "Middle", "High")),
+    sex = factor(sexvar, levels = c(1, 2),
+                   labels = c("Male", "Female")),
+    age = factor(
+      x_ageg5yr,
+      levels = 1:13,
+      labels = c(
+        "18–24", "25–29", "30–34", "35–39", "40–44",
+        "45–49", "50–54", "55–59", "60–64", "65–69",
+        "70–74", "75–79", "80+"
+      )
+    )
+  )
+
+brfss_simple = update(brfss_simple,
+                    SES  = df_simple$SES,
+                    sex = df_simple$sex,
+                    age = df_simple$age)
+
+mean_exc_design <- svyby(
+  ~ exerhmm1,
+  ~ SES,
+  design   = brfss_simple,
+  FUN      = svymean,
+  na.rm    = TRUE,
+  vartype  = c("se")
+)
+mean_exc_design
+## fitting linear model to exercise
+fit_mean <- svyglm(
+  exerhmm1 ~ SES + age + sex,
+  design = brfss_simple,
+  family = gaussian()
+)
+
+# helper: from a fitted linear model, compute model-based mean health by SES
+mean_exc_from_fit <- function(fit, design, ses_var = "SES") {
+# Fitted values (on response scale)
+  predicted_df <- data.frame(predict(fit), data = df_simple)
+  yhat <- predicted_df$link
+  std_err <- predicted_df$SE
+
+  dat <- model.frame(design)
+  ses <- dat[[ses_var]]
+  w   <- weights(design)
+
+  data.frame(SES = ses, yhat = yhat, w = w, std_err = std_err) %>%
+    group_by(SES) %>%
+    summarize(
+      mean_exc = sum(w * yhat) / sum(w),
+      var_mean    = sum( (w / sum(w))^2 * std_err^2 ),
+      se = sqrt(var_mean),
+      .groups     = "drop"
+    ) %>%
+    dplyr::select(SES, mean_exc, se)
+}
+
+
+mean_exc_model <- mean_exc_from_fit(fit_mean, brfss_simple)
+
+mean_exc_model
+
+one_swlb_mean <- function(b, data, base_design) {
+  w_base <- data$x_llcpwt
+  n      <- length(w_base)
+
+  shape  <- 1
+  scale  <- n * w_base / sum(w_base)
+  V      <- rgamma(n, shape = shape, scale = scale)
+  w_star <- V / sum(V) * sum(w_base)
+  data_b <- data
+  data_b$wt_swlb <- w_star
+  # survey design with S–WLB weights
+  des_b <- svydesign(
+    ids     = ~ x_psu,
+    strata  = ~ x_ststr,
+    weights = ~ wt_swlb,
+    nest    = TRUE,
+    data    = data_b
+  )
+
+  fit_b <- try(
+    svyglm(
+      exerhmm1 ~ SES + age + sex,
+      design = des_b,
+      family = gaussian()
+    ),
+    silent = TRUE
+  )
+  if (inherits(fit_b, "try-error")) return(NULL)
+
+  mh <- mean_exc_from_fit(fit_b, des_b)
+  mh$rep <- b
+  mh
+}
+
+## Run S–WLB in parallel ------------------------------------------------
+
+B_bench <- 200
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+
+set.seed(2025)
+swlb_mean_list <- future_lapply(
+  1:B_bench,
+  one_swlb_mean,
+  data        = df_simple,
+  base_design = brfss_simple
+)
+
+swlb_mean_res <- bind_rows(Filter(Negate(is.null), swlb_mean_list))
+
+swlb_mean_summary <- swlb_mean_res %>%
+  group_by(SES) %>%
+  summarize(
+    mean_exc_swlb = mean(mean_exc),
+    se_mean_swlb     = sd(mean_exc),
+    .groups          = "drop"
+  )
+swlb_mean_summary
+
+## 1. Rao–Wu-type bootstrap replicate-weight design --------------------
+brfss_rep_simple <- as.svrepdesign(
+  brfss_simple,
+  type      = "mrbbootstrap",
+  replicates = B_bench
+)
+
+# matrix of replicate design weights: n x B
+rep_wts_simple <- weights(brfss_rep_simple, type = "analysis")
+n1       <- nrow(df_simple)
+
+## 2. One D–OWLB replicate ---------------------------------------------
+
+one_dowlb_mean <- function(b, data, rep_wts_mat) {
+  w_rep <- rep_wts_mat[, b]
+
+  # WLB layer: Gamma draws around replicate weights
+  shape  <- 1
+  scale  <- n1 * w_rep / sum(w_rep)
+  V      <- rgamma(n1, shape = shape, scale = scale)
+  w_star <- V / sum(V) * sum(w_rep)
+
+  # Build replicate data and design with D-OWLB weights
+  data_b <- data
+  data_b$wt_dowlb <- w_star
+
+  des_b <- svydesign(
+    ids     = ~ x_psu,
+    strata  = ~ x_ststr,
+    weights = ~ wt_dowlb,
+    nest    = TRUE,
+    data    = data_b
+  )
+
+  fit_b <- try(
+    svyglm(
+      exerhmm1 ~ SES + age + sex,
+      design = des_b,
+      family = gaussian()
+    ),
+    silent = TRUE
+  )
+  if (inherits(fit_b, "try-error")) return(NULL)
+
+  mh <- mean_exc_from_fit(fit_b, des_b)
+  mh$rep <- b
+  mh
+}
+
+## 3. Run D–OWLB in parallel -------------------------------------------
+
+set.seed(456)
+
+dowlb_mean_list <- future_lapply(
+  1:B_bench,
+  one_dowlb_mean,
+  data        = df_simple,
+  rep_wts_mat = rep_wts_simple
+)
+
+dowlb_mean_res <- bind_rows(Filter(Negate(is.null), dowlb_mean_list))
+
+dowlb_mean_summary <- dowlb_mean_res %>%
+  group_by(SES) %>%
+  summarize(
+    mean_exc_dowlb = mean(mean_exc),
+    se_mean_dowlb     = sd(mean_exc),
+    .groups           = "drop"
+  )
+
+dowlb_mean_summary
+
+
+mean_exc_model %>%
+  select(SES, se_design = se) %>%
+  left_join(swlb_mean_summary %>% select(SES, se_mean_swlb),  by = "SES") %>%
+  left_join(dowlb_mean_summary %>% select(SES, se_mean_dowlb), by = "SES") %>%
+  mutate(
+    ratio_swlb  = se_mean_swlb  / se_design,
+    ratio_dowlb = se_mean_dowlb / se_design
+  )
+
+
+```

@@ -1,0 +1,572 @@
+---
+title: "swlb vs dowlb one stage cluster"
+author: "Ujjayini Das"
+date: "2025-12-01"
+output: html_document
+---
+
+```{r}
+############################################################
+## One-stage Cluster Design: D-OWLB vs S-WLB
+## Self-contained script — paste & run
+############################################################
+
+library(MASS)        # polr
+library(parallel)
+library(doParallel)
+library(foreach)
+
+set.seed(2026)
+
+############################################################
+# 0. Disparity functional
+############################################################
+
+apouey_disparity = function(cumprobs, gamma = 0.73, C = 2^gamma) {
+  1 - (C / length(cumprobs)) * sum(abs(cumprobs - 0.5)^gamma)
+}
+
+disparity_from_fit = function(fit, data,
+                              group_var = "SES",
+                              y_var = "Y",
+                              gamma = 0.73) {
+  K = length(levels(data[[y_var]]))
+  groups = sort(unique(data[[group_var]]))
+  Dg = setNames(numeric(length(groups)), groups)
+  for (g in groups) {
+    newdat = data
+    newdat[[group_var]] = factor(g, levels = levels(data[[group_var]]))
+    p_cat = predict(fit, newdata = newdat, type = "probs")
+    p_bar = colMeans(p_cat)
+    cumprobs = cumsum(p_bar)[1:(K - 1)]
+    Dg[g] = apouey_disparity(cumprobs, gamma = gamma)
+  }
+  Dg
+}
+
+############################################################
+# 1. Population generator (one stratum, many clusters)
+############################################################
+
+gen_population = function(N_pop = 1e5,
+                           mean_psu_size = 80,
+                           K = 5,
+                           sigma_u = 3) {
+
+  stratum = rep(1L, N_pop)
+  psu = integer(N_pop)
+  id  = seq_len(N_pop)
+
+  tab_h = table(stratum)
+  J_h_target = as.numeric(tab_h) / mean_psu_size
+  names(J_h_target) = names(tab_h)
+  # ensure a reasonable minimum of clusters
+  J_h = pmax(10L, round(J_h_target))
+  names(J_h) = names(tab_h)
+
+  for (h_char in names(tab_h)) {
+    h = as.integer(h_char)
+    idx_h = which(stratum == h)
+    nh = length(idx_h)
+    if (nh == 0) next
+    J_hh = J_h[h_char]
+    if (!is.finite(J_hh) || J_hh < 2) J_hh = 2L
+    J_hh = as.integer(J_hh)
+    psu[idx_h] = sample.int(J_hh, nh, replace = TRUE)
+  }
+
+  # PSU-level random effect
+  psu_df = unique(data.frame(stratum = stratum, psu = psu))
+  psu_df$u_hj = rnorm(nrow(psu_df), mean = 0, sd = sigma_u)
+
+  pop = data.frame(id = id, stratum = stratum, psu = psu)
+  pop = merge(pop, psu_df, by = c("stratum", "psu"), all.x = TRUE, sort = FALSE)
+  pop = pop[order(pop$id), ]
+
+  SES = sample(1:3, N_pop, replace = TRUE, prob = c(0.3, 0.4, 0.3))
+  X1  = rnorm(N_pop)
+  X2  = rbinom(N_pop, 1, 0.5)
+
+  beta_SES_stratum = matrix(c(0, -0.5, -1.0), nrow = 1, byrow = TRUE)
+  beta_SES_unit = beta_SES_stratum[cbind(pop$stratum, SES)]
+
+  eta = 0.1 + 0.5 * X1 + 0.8 * X2 + beta_SES_unit + pop$u_hj
+  alpha = c(-1.0, -0.3, 0.4, 1.2)
+
+  lp = sapply(alpha, function(a) plogis(a - eta))
+  p_cat = cbind(lp[, 1],
+                 lp[, 2] - lp[, 1],
+                 lp[, 3] - lp[, 2],
+                 lp[, 4] - lp[, 3],
+                 1 - lp[, 4])
+  Y = apply(p_cat, 1, function(p) sample(1:K, 1, prob = p))
+
+  pop$SES = factor(SES)
+  pop$X1 = X1
+  pop$X2 = X2
+  pop$Y  = factor(Y, ordered = TRUE)
+  pop$u_hj = NULL
+  pop
+}
+
+############################################################
+# 2. One-stage PPS cluster sampling with stage-wise weights
+############################################################
+
+sample_cluster = function(pop,
+                           m = 40,       # number of clusters to select
+                           m_j = 50) {   # SSUs per selected cluster
+  # Build PSU frame
+  psu_frame = aggregate(id ~ psu, data = pop, FUN = length)
+  names(psu_frame)[2] = "N_j"
+
+  # PPS measure: use cluster size
+  psu_frame$size = psu_frame$N_j
+  psu_frame$size[!is.finite(psu_frame$size) | psu_frame$size <= 0] = 1
+
+  # first-stage PPSWOR
+  J = nrow(psu_frame)
+  m_use = min(m, J)
+  prob = psu_frame$size / sum(psu_frame$size)
+  sel_idx = sample(seq_len(J), size = m_use, prob = prob, replace = FALSE)
+  sel_psu = psu_frame[sel_idx, , drop = FALSE]
+
+  # mark selected clusters
+  pop$psu_sel = pop$psu %in% sel_psu$psu
+
+  # second stage: SRSWOR fixed n_j per selected cluster
+  samp_list = lapply(split(pop, pop$psu), function(df) {
+    if (!df$psu_sel[1]) return(NULL)
+    # guard: if cluster has fewer units than required, take all
+    nj = min(m_j, nrow(df))
+    if (nj < 1) return(NULL)
+    df[sample(seq_len(nrow(df)), nj), , drop = FALSE]
+  })
+  samp_list2 = samp_list[!vapply(samp_list, is.null, logical(1))]
+  if (length(samp_list2) == 0) stop("sample_cluster: no units selected in second stage")
+  samp = do.call(rbind, samp_list2)
+
+  # ensure PSU column types consistent
+  samp$psu = as.integer(as.character(samp$psu))
+
+  # recompute PSU sample sizes
+  psu_samp = aggregate(id ~ psu, data = samp, FUN = length)
+  names(psu_samp)[2] = "n_j"
+  psu_samp = merge(psu_samp, psu_frame, by = "psu", all.x = TRUE, sort = FALSE)
+
+  # first-stage inclusion prob approx: m * N_j / sum(N_j)
+  psu_samp$pi1 = with(psu_samp, m_use * N_j / sum(N_j))
+  # guard pi1
+  psu_samp$pi1[psu_samp$pi1 > 1] = 1
+  psu_samp$w1  = 1 / psu_samp$pi1
+
+  # merge back to sample
+  samp = merge(samp, psu_samp[, c("psu", "N_j", "n_j", "w1", "pi1")],
+                by = "psu", all.x = TRUE, sort = FALSE)
+
+  # second-stage inclusion prob: n_j / N_j
+  samp$pi2 = with(samp, ifelse(N_j > 0, n_j / N_j, NA_real_))
+  samp$pi2[samp$pi2 > 1] = 1
+  samp$w2  = 1 / samp$pi2
+
+  # final weight
+  samp$w = samp$w1 * samp$w2
+  samp$pi = samp$pi1 * samp$pi2
+
+  samp$psu_sel = NULL
+  samp
+}
+
+############################################################
+# 3. Estimators: naive, weighted, S-WLB, D-OWLB (cluster level)
+############################################################
+
+fit_naive = function(samp, gamma = 0.73) {
+  fit = polr(Y ~ SES + X1 + X2, data = samp, Hess = TRUE, method = "logistic")
+  disparity_from_fit(fit, samp, group_var = "SES", gamma = gamma)
+}
+
+fit_weighted = function(samp, gamma = 0.73) {
+  fit = polr(Y ~ SES + X1 + X2, data = samp, weights = w,
+              Hess = TRUE, method = "logistic")
+  disparity_from_fit(fit, samp, group_var = "SES", gamma = gamma)
+}
+
+swlb_disp = function(samp, B = 400, gamma = 0.73) {
+  n = nrow(samp)
+  w_raw = samp$w
+  w_scaled = n * w_raw / sum(w_raw)
+
+  Glevels = levels(samp$SES)
+  res = matrix(NA_real_, nrow = B, ncol = length(Glevels),
+                dimnames = list(NULL, Glevels))
+
+  for (b in seq_len(B)) {
+    Yw = rgamma(n, shape = 1, scale = w_scaled)
+    g  = Yw / sum(Yw)
+
+    fitb = polr(Y ~ SES + X1 + X2,
+                 data = samp, weights = g,
+                 Hess = FALSE, method = "logistic")
+    res[b, ] = disparity_from_fit(fitb, samp, group_var = "SES", gamma = gamma)
+  }
+  res
+}
+
+# D-OWLB cluster-level: Rao-Wu at cluster level + WLB
+dowlb_cluster_disp = function(samp, B = 400, gamma = 0.73) {
+  n = nrow(samp)
+  if (n == 0) stop("dowlb_cluster_disp: empty samp")
+
+  Glevels = levels(samp$SES)
+  D_mat = matrix(NA_real_, nrow = B, ncol = length(Glevels),
+                  dimnames = list(NULL, Glevels))
+
+  # PSU table: one row per cluster with cluster weight = sum of final weights
+  psu_tab = aggregate(w ~ psu, data = samp, FUN = sum)
+  names(psu_tab)[2] = "w_j"
+  # ensure psu is integer in both tables to avoid merge type mismatch
+  psu_tab$psu = as.integer(as.character(psu_tab$psu))
+  samp$psu = as.integer(as.character(samp$psu))
+
+  m0 = nrow(psu_tab)
+  M0 = m0  # approximate frame size
+
+  for (b in seq_len(B)) {
+    if (m0 < 2) {
+      # no resampling possible: fallback to WLB on final weights
+      w_star = samp$w
+    } else {
+      # choose m_star (here m0-1, Rao-Wu style)
+      m_star = max(1L, m0 - 1L)
+      sel = sample(psu_tab$psu, size = m_star, replace = FALSE)
+      delta_j = as.integer(psu_tab$psu %in% sel)
+
+      f = m0 / M0
+      lambda = sqrt(m_star * (1 - f) / max(1, (m0 - m_star)))
+
+      w_j_orig = psu_tab$w_j
+      w_j_star = w_j_orig * (1 - lambda + lambda * (m0 / max(1, m_star)) * delta_j)
+
+      # Build replication DF and ensure types match
+      rw_df = data.frame(psu = psu_tab$psu,
+                          w_j = w_j_orig,
+                          w_j_star = w_j_star,
+                          stringsAsFactors = FALSE)
+      # ensure integer keys (critical fix to avoid 0-row merge)
+      rw_df$psu = as.integer(as.character(rw_df$psu))
+      samp$psu = as.integer(as.character(samp$psu))
+
+      # Merge replicate factors to units
+      samp_b = merge(samp, rw_df, by = "psu", all.x = TRUE, sort = FALSE)
+      samp_b = samp_b[order(samp_b$id), ]  # restore original order (by population id)
+      if (nrow(samp_b) != nrow(samp)) stop("dowlb_cluster_disp: merge changed row count")
+      if (any(is.na(samp_b$w_j_star))) stop("dowlb_cluster_disp: missing w_j_star after merge")
+
+      # replicate unit weights = original final weight * (w_j_star / w_j)
+      w_star = samp_b$w * (samp_b$w_j_star / samp_b$w_j)
+    }
+
+    # guard non-finite or non-positive replicate weights
+    good = is.finite(w_star) & (w_star > 0)
+    if (!all(good)) {
+      min_pos = min(w_star[good], na.rm = TRUE)
+      if (!is.finite(min_pos)) min_pos = 1e-8
+      w_star[!good] = min_pos
+    }
+
+    # normalize for WLB
+    w_tilde = n * w_star / sum(w_star)
+
+    V = rgamma(n, shape = 1, scale = w_tilde)
+    g = V / sum(V)
+
+    fitb = polr(Y ~ SES + X1 + X2,
+                 data = samp, weights = g,
+                 Hess = FALSE, method = "logistic")
+    D_mat[b, ] = disparity_from_fit(fitb, samp, group_var = "SES", gamma = gamma)
+  }
+
+  D_mat
+}
+
+############################################################
+# 4. Monte Carlo simulation (parallel)
+############################################################
+
+N_pop    = 1e5
+K        = 5
+n_sims   = 100
+B_boot   = 400
+gamma_D  = 0.73
+
+pop = gen_population(N_pop = N_pop, mean_psu_size = 80, K = K, sigma_u = 1.5)
+
+# finite-population truth: compute Apouey disparity from population distribution per group
+true_D = sapply(levels(pop$SES), function(g) {
+  sub = pop[pop$SES == g, ]
+  tab = table(sub$Y)
+  p_cat = as.numeric(tab) / sum(tab)
+  cumprobs = cumsum(p_cat)[1:(length(p_cat) - 1)]
+  apouey_disparity(cumprobs, gamma = gamma_D)
+})
+names(true_D) = levels(pop$SES)
+groups = levels(pop$SES)
+
+sim_one = function(rep_id) {
+  message("Sim ", rep_id)
+  samp = sample_cluster(pop, m = 40, m_j = 50)
+  if (nrow(samp) == 0) stop("empty sample")
+
+  D_naive = fit_naive(samp, gamma = gamma_D)
+  D_wt    = fit_weighted(samp, gamma = gamma_D)
+
+  swlb_mat = swlb_disp(samp, B = B_boot, gamma = gamma_D)
+  s_mean = colMeans(swlb_mat, na.rm = TRUE)
+  s_var  = apply(swlb_mat, 2, var, na.rm = TRUE)
+  s_L    = apply(swlb_mat, 2, quantile, probs = 0.025, na.rm = TRUE)
+  s_U    = apply(swlb_mat, 2, quantile, probs = 0.975, na.rm = TRUE)
+
+  dowlb_mat = dowlb_cluster_disp(samp, B = B_boot, gamma = gamma_D)
+  d_mean = colMeans(dowlb_mat, na.rm = TRUE)
+  d_var  = apply(dowlb_mat, 2, var, na.rm = TRUE)
+  d_L    = apply(dowlb_mat, 2, quantile, probs = 0.025, na.rm = TRUE)
+  d_U    = apply(dowlb_mat, 2, quantile, probs = 0.975, na.rm = TRUE)
+
+  list(
+    D_true  = true_D,
+    D_naive = D_naive,
+    D_wt    = D_wt,
+    D_swlb  = s_mean,
+    D_dowlb = d_mean,
+    s_L = s_L, s_U = s_U, s_var = s_var,
+    d_L = d_L, d_U = d_U, d_var = d_var
+  )
+}
+
+# parallel run
+n_cores = max(1L, detectCores() - 1L)
+cl = makeCluster(n_cores)
+registerDoParallel(cl)
+
+export_objs = c("pop", "true_D", "sample_cluster",
+                 "fit_naive", "fit_weighted",
+                 "swlb_disp", "dowlb_cluster_disp",
+                 "disparity_from_fit", "apouey_disparity", "gamma_D")
+
+results_cluster = foreach(rep_id = seq_len(n_sims),
+                           .packages = "MASS",
+                           .export = export_objs,
+                           .errorhandling = "stop") %dopar% {
+  sim_one(rep_id)
+}
+
+## strong clustering
+results_cluster2 = foreach(rep_id = seq_len(n_sims),
+                           .packages = "MASS",
+                           .export = export_objs,
+                           .errorhandling = "stop") %dopar% {
+  sim_one(rep_id)
+}
+stopCluster(cl)
+
+############################################################
+# 5. Summaries: bias, RMSE, coverage, variance, MSE
+############################################################
+
+res_tbl_cluster = data.frame(
+  group = groups,
+  rel_bias_naive    = NA,
+  rel_bias_wt       = NA,
+  rel_rmse_wt       = NA,
+  rel_bias_swlb     = NA,
+  rel_rmse_swlb     = NA,
+  rel_bias_dowlb    = NA,
+  rel_rmse_dowlb    = NA,
+  cov_swlb          = NA,
+  cov_dowlb         = NA,
+  var_ratio_swlb    = NA,
+  var_ratio_dowlb   = NA,
+  bias_wt           = NA,
+  var_wt            = NA,
+  mse_wt            = NA,
+  bias2_over_mse_wt = NA,
+  var_over_mse_wt   = NA,
+  mse_swlb          = NA,
+  mse_dowlb         = NA,
+  mse_ratio_swlb    = NA,
+  mse_ratio_dowlb   = NA,
+  stringsAsFactors  = FALSE
+)
+
+for (g in groups) {
+  true_g     = sapply(results_cluster, function(x) x$D_true[g])
+  hat_n_g    = sapply(results_cluster, function(x) x$D_naive[g])
+  hat_w_g    = sapply(results_cluster, function(x) x$D_wt[g])
+  hat_s_g    = sapply(results_cluster, function(x) x$D_swlb[g])
+  hat_d_g    = sapply(results_cluster, function(x) x$D_dowlb[g])
+
+  mean_true  = mean(true_g, na.rm = TRUE)
+
+  mean_w  = mean(hat_w_g, na.rm = TRUE)
+  bias_w  = mean_w - mean_true
+  var_w   = var(hat_w_g, na.rm = TRUE)
+  mse_w   = mean((hat_w_g - true_g)^2, na.rm = TRUE)
+
+  mse_s   = mean((hat_s_g - true_g)^2, na.rm = TRUE)
+  mse_d   = mean((hat_d_g - true_g)^2, na.rm = TRUE)
+
+  s_var_g   = sapply(results_cluster, function(x) x$s_var[g])
+  d_var_g   = sapply(results_cluster, function(x) x$d_var[g])
+  mean_s_var = mean(s_var_g, na.rm = TRUE)
+  mean_d_var = mean(d_var_g, na.rm = TRUE)
+
+  res_tbl_cluster2$rel_bias_naive[res_tbl_cluster2$group == g] =
+    100 * mean(hat_n_g - true_g, na.rm = TRUE) / mean_true
+  res_tbl_cluster2$rel_bias_wt[res_tbl_cluster2$group == g] =
+    100 * (mean_w - mean_true) / mean_true
+  res_tbl_cluster2$rel_bias_swlb[res_tbl_cluster2$group == g] =
+    100 * (mean(hat_s_g, na.rm = TRUE) - mean_true) / mean_true
+  res_tbl_cluster2$rel_bias_dowlb[res_tbl_cluster2$group == g] =
+    100 * (mean(hat_d_g, na.rm = TRUE) - mean_true) / mean_true
+
+  rmse_w = sqrt(mse_w)
+  rmse_s = sqrt(mse_s)
+  rmse_d = sqrt(mse_d)
+
+  res_tbl_cluster2$rel_rmse_wt[res_tbl_cluster2$group == g]    = 100 * rmse_w / mean_true
+  res_tbl_cluster2$rel_rmse_swlb[res_tbl_cluster2$group == g]  = 100 * rmse_s / mean_true
+  res_tbl_cluster2$rel_rmse_dowlb[res_tbl_cluster2$group == g] = 100 * rmse_d / mean_true
+
+  s_Lg = sapply(results_cluster, function(x) x$s_L[g])
+  s_Ug = sapply(results_cluster, function(x) x$s_U[g])
+  d_Lg = sapply(results_cluster, function(x) x$d_L[g])
+  d_Ug = sapply(results_cluster, function(x) x$d_U[g])
+
+  res_tbl_cluster2$cov_swlb[res_tbl_cluster2$group == g] =
+    mean(true_g >= s_Lg & true_g <= s_Ug, na.rm = TRUE)
+  res_tbl_cluster2$cov_dowlb[res_tbl_cluster2$group == g] =
+    mean(true_g >= d_Lg & true_g <= d_Ug, na.rm = TRUE)
+
+  res_tbl_cluster2$var_ratio_swlb[res_tbl_cluster2$group == g] = mean_s_var / var_w
+  res_tbl_cluster2$var_ratio_dowlb[res_tbl_cluster2$group == g] = mean_d_var / var_w
+
+  res_tbl_cluster2$bias_wt[res_tbl_cluster2$group == g]  = bias_w
+  res_tbl_cluster2$var_wt[res_tbl_cluster2$group == g]   = var_w
+  res_tbl_cluster2$mse_wt[res_tbl_cluster2$group == g]   = mse_w
+  if (mse_w > 0) {
+    res_tbl_cluster2$bias2_over_mse_wt[res_tbl_cluster2$group == g] = (bias_w^2) / mse_w
+    res_tbl_cluster2$var_over_mse_wt[res_tbl_cluster2$group == g]   = var_w / mse_w
+  }
+
+  res_tbl_cluster2$mse_swlb[res_tbl_cluster2$group == g]    = mse_s
+  res_tbl_cluster2$mse_dowlb[res_tbl_cluster2$group == g]   = mse_d
+  if (mse_w > 0) {
+    res_tbl_cluster2$mse_ratio_swlb[res_tbl_cluster2$group == g]  = mse_s / mse_w
+    res_tbl_cluster2$mse_ratio_dowlb[res_tbl_cluster2$group == g] = mse_d / mse_w
+  }
+}
+```
+
+```{r}
+# 5. Summaries: bias, RMSE, coverage, variance, MSE
+############################################################
+
+res_tbl_cluster2 = data.frame(
+  group = groups,
+  rel_bias_naive    = NA,
+  rel_bias_wt       = NA,
+  rel_rmse_wt       = NA,
+  rel_bias_swlb     = NA,
+  rel_rmse_swlb     = NA,
+  rel_bias_dowlb    = NA,
+  rel_rmse_dowlb    = NA,
+  cov_swlb          = NA,
+  cov_dowlb         = NA,
+  var_ratio_swlb    = NA,
+  var_ratio_dowlb   = NA,
+  bias_wt           = NA,
+  var_wt            = NA,
+  mse_wt            = NA,
+  bias2_over_mse_wt = NA,
+  var_over_mse_wt   = NA,
+  mse_swlb          = NA,
+  mse_dowlb         = NA,
+  mse_ratio_swlb    = NA,
+  mse_ratio_dowlb   = NA,
+  stringsAsFactors  = FALSE
+)
+
+for (g in groups) {
+  true_g     = sapply(results_cluster2, function(x) x$D_true[g])
+  hat_n_g    = sapply(results_cluster2, function(x) x$D_naive[g])
+  hat_w_g    = sapply(results_cluster2, function(x) x$D_wt[g])
+  hat_s_g    = sapply(results_cluster2, function(x) x$D_swlb[g])
+  hat_d_g    = sapply(results_cluster2, function(x) x$D_dowlb[g])
+
+  mean_true  = mean(true_g, na.rm = TRUE)
+
+  mean_w  = mean(hat_w_g, na.rm = TRUE)
+  bias_w  = mean_w - mean_true
+  var_w   = var(hat_w_g, na.rm = TRUE)
+  mse_w   = mean((hat_w_g - true_g)^2, na.rm = TRUE)
+
+  mse_s   = mean((hat_s_g - true_g)^2, na.rm = TRUE)
+  mse_d   = mean((hat_d_g - true_g)^2, na.rm = TRUE)
+
+  s_var_g   = sapply(results_cluster2, function(x) x$s_var[g])
+  d_var_g   = sapply(results_cluster2, function(x) x$d_var[g])
+  mean_s_var = mean(s_var_g, na.rm = TRUE)
+  mean_d_var = mean(d_var_g, na.rm = TRUE)
+
+  res_tbl_cluster2$rel_bias_naive[res_tbl_cluster2$group == g] =
+    100 * mean(hat_n_g - true_g, na.rm = TRUE) / mean_true
+  res_tbl_cluster2$rel_bias_wt[res_tbl_cluster2$group == g] =
+    100 * (mean_w - mean_true) / mean_true
+  res_tbl_cluster2$rel_bias_swlb[res_tbl_cluster2$group == g] =
+    100 * (mean(hat_s_g, na.rm = TRUE) - mean_true) / mean_true
+  res_tbl_cluster2$rel_bias_dowlb[res_tbl_cluster2$group == g] =
+    100 * (mean(hat_d_g, na.rm = TRUE) - mean_true) / mean_true
+
+  rmse_w = sqrt(mse_w)
+  rmse_s = sqrt(mse_s)
+  rmse_d = sqrt(mse_d)
+
+  res_tbl_cluster2$rel_rmse_wt[res_tbl_cluster2$group == g]    = 100 * rmse_w / mean_true
+  res_tbl_cluster2$rel_rmse_swlb[res_tbl_cluster2$group == g]  = 100 * rmse_s / mean_true
+  res_tbl_cluster2$rel_rmse_dowlb[res_tbl_cluster2$group == g] = 100 * rmse_d / mean_true
+
+  s_Lg = sapply(results_cluster2, function(x) x$s_L[g])
+  s_Ug = sapply(results_cluster2, function(x) x$s_U[g])
+  d_Lg = sapply(results_cluster2, function(x) x$d_L[g])
+  d_Ug = sapply(results_cluster2, function(x) x$d_U[g])
+
+  res_tbl_cluster2$cov_swlb[res_tbl_cluster2$group == g] =
+    mean(true_g >= s_Lg & true_g <= s_Ug, na.rm = TRUE)
+  res_tbl_cluster2$cov_dowlb[res_tbl_cluster2$group == g] =
+    mean(true_g >= d_Lg & true_g <= d_Ug, na.rm = TRUE)
+
+  res_tbl_cluster2$var_ratio_swlb[res_tbl_cluster2$group == g] = mean_s_var / var_w
+  res_tbl_cluster2$var_ratio_dowlb[res_tbl_cluster2$group == g] = mean_d_var / var_w
+
+  res_tbl_cluster2$bias_wt[res_tbl_cluster2$group == g]  = bias_w
+  res_tbl_cluster2$var_wt[res_tbl_cluster2$group == g]   = var_w
+  res_tbl_cluster2$mse_wt[res_tbl_cluster2$group == g]   = mse_w
+  if (mse_w > 0) {
+    res_tbl_cluster2$bias2_over_mse_wt[res_tbl_cluster2$group == g] = (bias_w^2) / mse_w
+    res_tbl_cluster2$var_over_mse_wt[res_tbl_cluster2$group == g]   = var_w / mse_w
+  }
+
+  res_tbl_cluster2$mse_swlb[res_tbl_cluster2$group == g]    = mse_s
+  res_tbl_cluster2$mse_dowlb[res_tbl_cluster2$group == g]   = mse_d
+  if (mse_w > 0) {
+    res_tbl_cluster2$mse_ratio_swlb[res_tbl_cluster2$group == g]  = mse_s / mse_w
+    res_tbl_cluster2$mse_ratio_dowlb[res_tbl_cluster2$group == g] = mse_d / mse_w
+  }
+}
+
+print(res_tbl_cluster2)
+write.csv(res_tbl_cluster, "Results_DWOLB/comparison_onestage_cluster_moderate_clustering.csv")
+write.csv(res_tbl_cluster2, "Results_DWOLB/comparison_onestage_cluster_strong_clustering.csv")
+
+```
