@@ -8,7 +8,6 @@ output: html_document
 ```{r}
 ############################################################
 ## One-stage Cluster Design: D-OWLB vs S-WLB
-## Self-contained script — paste & run
 ############################################################
 
 library(MASS)        # polr
@@ -291,7 +290,7 @@ dowlb_cluster_disp = function(samp, B = 400, gamma = 0.73) {
 }
 
 ############################################################
-# 4. Monte Carlo simulation (parallel)
+# 4. Monte Carlo simulation
 ############################################################
 
 N_pop    = 1e5
@@ -300,7 +299,7 @@ n_sims   = 100
 B_boot   = 400
 gamma_D  = 0.73
 
-pop = gen_population(N_pop = N_pop, mean_psu_size = 80, K = K, sigma_u = 1.5)
+pop = gen_population(N_pop = N_pop, mean_psu_size = 80, K = K, sigma_u = 1.2) # change sigma_u for varying ICC and rerun
 
 # finite-population truth: compute Apouey disparity from population distribution per group
 true_D = sapply(levels(pop$SES), function(g) {
@@ -421,55 +420,56 @@ for (g in groups) {
   mean_s_var = mean(s_var_g, na.rm = TRUE)
   mean_d_var = mean(d_var_g, na.rm = TRUE)
 
-  res_tbl_cluster2$rel_bias_naive[res_tbl_cluster2$group == g] =
+  res_tbl_cluster$rel_bias_naive[res_tbl_cluster$group == g] =
     100 * mean(hat_n_g - true_g, na.rm = TRUE) / mean_true
-  res_tbl_cluster2$rel_bias_wt[res_tbl_cluster2$group == g] =
+  res_tbl_cluster$rel_bias_wt[res_tbl_cluster$group == g] =
     100 * (mean_w - mean_true) / mean_true
-  res_tbl_cluster2$rel_bias_swlb[res_tbl_cluster2$group == g] =
+  res_tbl_cluster$rel_bias_swlb[res_tbl_cluster$group == g] =
     100 * (mean(hat_s_g, na.rm = TRUE) - mean_true) / mean_true
-  res_tbl_cluster2$rel_bias_dowlb[res_tbl_cluster2$group == g] =
+  res_tbl_cluster$rel_bias_dowlb[res_tbl_cluster$group == g] =
     100 * (mean(hat_d_g, na.rm = TRUE) - mean_true) / mean_true
 
   rmse_w = sqrt(mse_w)
   rmse_s = sqrt(mse_s)
   rmse_d = sqrt(mse_d)
 
-  res_tbl_cluster2$rel_rmse_wt[res_tbl_cluster2$group == g]    = 100 * rmse_w / mean_true
-  res_tbl_cluster2$rel_rmse_swlb[res_tbl_cluster2$group == g]  = 100 * rmse_s / mean_true
-  res_tbl_cluster2$rel_rmse_dowlb[res_tbl_cluster2$group == g] = 100 * rmse_d / mean_true
+  res_tbl_cluster$rel_rmse_wt[res_tbl_cluster$group == g]    = 100 * rmse_w / mean_true
+  res_tbl_cluster$rel_rmse_swlb[res_tbl_cluster$group == g]  = 100 * rmse_s / mean_true
+  res_tbl_cluster$rel_rmse_dowlb[res_tbl_cluster$group == g] = 100 * rmse_d / mean_true
 
   s_Lg = sapply(results_cluster, function(x) x$s_L[g])
   s_Ug = sapply(results_cluster, function(x) x$s_U[g])
   d_Lg = sapply(results_cluster, function(x) x$d_L[g])
   d_Ug = sapply(results_cluster, function(x) x$d_U[g])
 
-  res_tbl_cluster2$cov_swlb[res_tbl_cluster2$group == g] =
+  res_tbl_cluster$cov_swlb[res_tbl_cluster$group == g] =
     mean(true_g >= s_Lg & true_g <= s_Ug, na.rm = TRUE)
-  res_tbl_cluster2$cov_dowlb[res_tbl_cluster2$group == g] =
+  res_tbl_cluster$cov_dowlb[res_tbl_cluster$group == g] =
     mean(true_g >= d_Lg & true_g <= d_Ug, na.rm = TRUE)
 
-  res_tbl_cluster2$var_ratio_swlb[res_tbl_cluster2$group == g] = mean_s_var / var_w
-  res_tbl_cluster2$var_ratio_dowlb[res_tbl_cluster2$group == g] = mean_d_var / var_w
+  res_tbl_cluster$var_ratio_swlb[res_tbl_cluster$group == g] = mean_s_var / var_w
+  res_tbl_cluster$var_ratio_dowlb[res_tbl_cluster$group == g] = mean_d_var / var_w
 
-  res_tbl_cluster2$bias_wt[res_tbl_cluster2$group == g]  = bias_w
-  res_tbl_cluster2$var_wt[res_tbl_cluster2$group == g]   = var_w
-  res_tbl_cluster2$mse_wt[res_tbl_cluster2$group == g]   = mse_w
+  res_tbl_cluster$bias_wt[res_tbl_cluster$group == g]  = bias_w
+  res_tbl_cluster$var_wt[res_tbl_cluster$group == g]   = var_w
+  res_tbl_cluster$mse_wt[res_tbl_cluster$group == g]   = mse_w
   if (mse_w > 0) {
-    res_tbl_cluster2$bias2_over_mse_wt[res_tbl_cluster2$group == g] = (bias_w^2) / mse_w
-    res_tbl_cluster2$var_over_mse_wt[res_tbl_cluster2$group == g]   = var_w / mse_w
+    res_tbl_cluster$bias2_over_mse_wt[res_tbl_cluster$group == g] = (bias_w^2) / mse_w
+    res_tbl_cluster$var_over_mse_wt[res_tbl_cluster$group == g]   = var_w / mse_w
   }
 
-  res_tbl_cluster2$mse_swlb[res_tbl_cluster2$group == g]    = mse_s
-  res_tbl_cluster2$mse_dowlb[res_tbl_cluster2$group == g]   = mse_d
+  res_tbl_cluster$mse_swlb[res_tbl_cluster$group == g]    = mse_s
+  res_tbl_cluster$mse_dowlb[res_tbl_cluster$group == g]   = mse_d
   if (mse_w > 0) {
-    res_tbl_cluster2$mse_ratio_swlb[res_tbl_cluster2$group == g]  = mse_s / mse_w
-    res_tbl_cluster2$mse_ratio_dowlb[res_tbl_cluster2$group == g] = mse_d / mse_w
+    res_tbl_cluster$mse_ratio_swlb[res_tbl_cluster$group == g]  = mse_s / mse_w
+    res_tbl_cluster$mse_ratio_dowlb[res_tbl_cluster$group == g] = mse_d / mse_w
   }
 }
 ```
 
 ```{r}
-# 5. Summaries: bias, RMSE, coverage, variance, MSE
+############################################################
+# 6. Summaries: bias, RMSE, coverage, variance, MSE
 ############################################################
 
 res_tbl_cluster2 = data.frame(
@@ -568,5 +568,6 @@ for (g in groups) {
 print(res_tbl_cluster2)
 write.csv(res_tbl_cluster, "Results_DWOLB/comparison_onestage_cluster_moderate_clustering.csv")
 write.csv(res_tbl_cluster2, "Results_DWOLB/comparison_onestage_cluster_strong_clustering.csv")
+
 
 ```
