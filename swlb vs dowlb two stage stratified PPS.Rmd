@@ -20,12 +20,11 @@ library(foreach)
 ```{r}
 ############################################################
 ## Design-aware OWLB vs S-WLB: Two-stage Stratified Design
-## Fixed and defensive version for parallel runs
 ############################################################
 
 
 ############################################################
-# 0. Disparity functional and helper (unchanged)
+# 0. Disparity functional and helper 
 ############################################################
 
 apouey_disparity = function(cumprobs, gamma = 0.73, C = 2^gamma) {
@@ -53,7 +52,6 @@ disparity_from_fit = function(fit, data,
 
 ############################################################
 # 1. Generate finite population with strong PSU effects
-#    (fixed sample.int bug and defensive code)
 ############################################################
 
 gen_population = function(N_pop = 1e5,
@@ -105,8 +103,7 @@ gen_population = function(N_pop = 1e5,
     nrow = H, byrow = TRUE
   )
 
-  # ensure indexing safe:
-  if (any(pop$stratum < 1 | pop$stratum > nrow(beta_SES_stratum))) {
+   if (any(pop$stratum < 1 | pop$stratum > nrow(beta_SES_stratum))) {
     stop("gen_population: unexpected stratum labels")
   }
   beta_SES_unit = beta_SES_stratum[cbind(pop$stratum, SES)]
@@ -134,7 +131,6 @@ gen_population = function(N_pop = 1e5,
 
 ############################################################
 # 2. Two-stage stratified PPS design (informative)
-#    (made psu_frame creation robust and safe handling of empty lists)
 ############################################################
 
 sample_two_stage = function(pop,
@@ -400,7 +396,7 @@ dowlb_twostage_disp = function(samp, B = 400, gamma = 0.73,
 
     samp_b$w_i_cond_star = NA_real_
 
-    # iterate PSUs (could be vectorized with data.table for speed)
+    # iterate PSUs 
     pu_keys = unique(paste(samp_b$stratum, samp_b$psu, sep = "||"))
     for (key in pu_keys) {
       idx_units = which(paste(samp_b$stratum, samp_b$psu, sep = "||") == key)
@@ -506,7 +502,7 @@ B_boot   = 400
 gamma_D  = 0.73
 
 set.seed(2025)
-pop = gen_population(N_pop = N_pop, H = H, K = K, sigma_u = 1.5)
+pop = gen_population(N_pop = N_pop, H = H, K = K, sigma_u = 1.2)
 
 true_D = sapply(levels(pop$SES), function(g) {
   sub = pop[pop$SES == g, ]
@@ -698,7 +694,7 @@ for (g in groups) {
 }
 
 print(res_tbl)
-write.csv(res_tbl,"Results_DWOLB/comparison_twostage_stratified_cluster_strong_clustering.csv")
+write.csv(res_tbl,"Results_DWOLB/comparison_twostage_stratified_cluster_moderate_clustering.csv")
 ```
 
 ```{r}
@@ -817,5 +813,6 @@ for (g in groups) {
 }
 
 print(res_tbl2)
-write.csv(res_tbl2,"Results_DWOLB/comparison_twostage_stratified_cluster_moderate_clustering.csv")
+write.csv(res_tbl2,"Results_DWOLB/comparison_twostage_stratified_cluster_strong_clustering.csv")
+
 ```
